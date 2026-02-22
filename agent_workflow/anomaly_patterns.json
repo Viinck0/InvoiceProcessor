@@ -1,0 +1,138 @@
+{
+    "cv_resume": {
+        "keywords": [
+            "životopis",
+            "curriculum vitae",
+            "curriculum",
+            "cv ",
+            "narozen",
+            "rodné číslo",
+            "bydliště",
+            "vzdělání",
+            "pracovní zkušenosti",
+            "praxe",
+            "zaměstnání",
+            "pracovní pozice",
+            "popis práce",
+            "reference",
+            "dovednosti",
+            "kompetence",
+            "kariéra"
+        ],
+        "threshold": 2,
+        "description": "Životopis nebo CV",
+        "veto": true
+    },
+    "certificate": {
+        "keywords": [
+            "certifikát",
+            "osvědčení",
+            "licence",
+            "akreditace",
+            "absolvoval",
+            "ukončil",
+            "úspěšně složil",
+            "zkoušku",
+            "kurz",
+            "školení",
+            "seminář",
+            "vzdělávací program",
+            "profesní kvalifikace"
+        ],
+        "threshold": 2,
+        "description": "Certifikát nebo osvědčení",
+        "veto": true
+    },
+    "education": {
+        "keywords": [
+            "ibm skillsbuild",
+            "skillsbuild",
+            "modul",
+            "kapitola",
+            "lekce",
+            "studijní materiál",
+            "vzdělávací obsah",
+            "e-learning",
+            "online kurz"
+        ],
+        "threshold": 1,
+        "description": "Vzdělávací materiál",
+        "veto": true
+    },
+    "contract": {
+        "keywords": [
+            "smlouva",
+            "dohoda",
+            "dodatek",
+            "nájemní smlouva",
+            "pracovní smlouva",
+            "kupní smlouva",
+            "dodatková smlouva"
+        ],
+        "threshold": 2,
+        "description": "Smlouva nebo dohoda",
+        "veto": true
+    },
+    "reminder": {
+        "keywords": [
+            "upomínka",
+            "reminder",
+            "výzva k úhradě",
+            "upomínací dopis"
+        ],
+        "threshold": 1,
+        "description": "Upomínka (okamžitě zamítnout)",
+        "veto": true
+    },
+    "offer": {
+        "keywords": [
+            "nabídka",
+            "offer",
+            "cenová kalkulace",
+            "rozpočet",
+            "kalkulace nákladů",
+            "cenová nabídka"
+        ],
+        "threshold": 1,
+        "description": "Nabídka nebo rozpočet",
+        "veto": false
+    },
+    "order": {
+        "keywords": [
+            "objednávka",
+            "purchase order",
+            "poptávka",
+            "objednávkový list"
+        ],
+        "threshold": 1,
+        "description": "Objednávka",
+        "veto": false
+    },
+    "email": {
+        "keywords": [
+            "e-mail",
+            "email",
+            "dopis",
+            "korespondence",
+            "odesílatel",
+            "komu",
+            "předmět"
+        ],
+        "threshold": 2,
+        "description": "E-mail nebo dopis",
+        "veto": false
+    },
+    "internal": {
+        "keywords": [
+            "interní",
+            "internal",
+            "pracovní",
+            "koncept",
+            "draft",
+            "návrh dokumentu"
+        ],
+        "threshold": 2,
+        "description": "Interní dokument",
+        "veto": false
+    }
+}
