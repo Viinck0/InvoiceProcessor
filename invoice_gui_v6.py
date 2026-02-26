@@ -60,10 +60,11 @@ SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".gif"
 TEXT_MODEL = "llama3.2"  # Používáme llama3.2 (llama3.1 není nainstalován)
 LOG_LEVEL = logging.INFO
 REQUEST_TIMEOUT = 60
-MAX_MEMORY_PERCENT = 85
+MAX_MEMORY_PERCENT = 70  # Snížen z 85% pro dřívější GC
 DEBUG_MEMORY = True
 BATCH_SIZE = 3
-MEMORY_CHECK_EVERY = 1
+MEMORY_CHECK_EVERY = 5  # Kontrolovat každých 5 souborů (bylo 1)
+GC_EVERY = 10  # Spustit GC každých 10 souborů
 
 # OCR konstanty
 OCR_LANG = "ces+eng"
@@ -138,8 +139,8 @@ class Invoice:
     is_invoice: bool = False
     confidence: float = 0.0
     raw_json: dict = field(default_factory=dict)
-    ocr_text: str = ""
-    
+    # OCR text není uložen - šetří paměť (byl příčinou memory leak)
+
     # Nová pole pro v6 - agent results
     agent_results: dict = field(default_factory=dict)
     consensus_result: dict = field(default_factory=dict)
@@ -451,49 +452,55 @@ class MultiAgentProcessor:
 
         start_time = time.time()
 
-        # Vytvoření invoice objektu
-        invoice = Invoice(source_path=file_path, ocr_text=ocr_text)
+        # Vytvoření invoice objektu (bez ukládání OCR textu - šetří paměť)
+        invoice = Invoice(source_path=file_path)
 
+        executor = None
         try:
             # Paralelní spuštění agentů
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                # Submit all tasks
-                future_classifier = executor.submit(
-                    self.classifier.analyze,
-                    ocr_text,
-                    {'filename': file_path.name}
-                )
-                future_extractor = executor.submit(
-                    self.extractor.analyze,
-                    ocr_text,
-                    {'filename': file_path.name}
-                )
-                future_anomaly = executor.submit(
-                    self.anomaly.analyze,
-                    ocr_text,
-                    {'filename': file_path.name}
-                )
+            executor = ThreadPoolExecutor(max_workers=3)
+            
+            # Submit all tasks
+            future_classifier = executor.submit(
+                self.classifier.analyze,
+                ocr_text,
+                {'filename': file_path.name}
+            )
+            future_extractor = executor.submit(
+                self.extractor.analyze,
+                ocr_text,
+                {'filename': file_path.name}
+            )
+            future_anomaly = executor.submit(
+                self.anomaly.analyze,
+                ocr_text,
+                {'filename': file_path.name}
+            )
 
-                # Wait for results with timeout
-                try:
-                    classifier_result = future_classifier.result(timeout=REQUEST_TIMEOUT + 10)
-                    extractor_result = future_extractor.result(timeout=REQUEST_TIMEOUT + 25)
-                    anomaly_result = future_anomaly.result(timeout=REQUEST_TIMEOUT + 10)
-                    
-                    # Debug: log raw results
-                    logger.debug(f"Classifier result type: {type(classifier_result)}")
-                    logger.debug(f"Extractor result type: {type(extractor_result)}")
-                    logger.debug(f"Anomaly result type: {type(anomaly_result)}")
-                    
-                except Exception as agent_error:
-                    logger.error(f"  Agent execution error: {agent_error}")
-                    logger.error(f"  Error type: {type(agent_error)}")
-                    import traceback
-                    logger.error(f"  Traceback: {traceback.format_exc()}")
-                    # Use fallback results
-                    classifier_result = {'is_invoice': False, 'confidence': 0.0, 'reasoning': 'Agent error'}
-                    extractor_result = {'completeness_score': 0.0, 'validation_errors': ['Error']}
-                    anomaly_result = {'is_anomaly': False, 'confidence': 0.0}
+            # Wait for results with timeout
+            try:
+                classifier_result = future_classifier.result(timeout=REQUEST_TIMEOUT + 10)
+                extractor_result = future_extractor.result(timeout=REQUEST_TIMEOUT + 25)
+                anomaly_result = future_anomaly.result(timeout=REQUEST_TIMEOUT + 10)
+
+                # Debug: log raw results
+                logger.debug(f"Classifier result type: {type(classifier_result)}")
+                logger.debug(f"Extractor result type: {type(extractor_result)}")
+                logger.debug(f"Anomaly result type: {type(anomaly_result)}")
+
+            except Exception as agent_error:
+                logger.error(f"  Agent execution error: {agent_error}")
+                logger.error(f"  Error type: {type(agent_error)}")
+                import traceback
+                logger.error(f"  Traceback: {traceback.format_exc()}")
+                # Use fallback results
+                classifier_result = {'is_invoice': False, 'confidence': 0.0, 'reasoning': 'Agent error'}
+                extractor_result = {'completeness_score': 0.0, 'validation_errors': ['Error']}
+                anomaly_result = {'is_anomaly': False, 'confidence': 0.0}
+
+            # Explicitně shutdown executor
+            executor.shutdown(wait=True)
+            executor = None
 
             # Validate results are dicts
             if not isinstance(classifier_result, dict):
@@ -581,19 +588,25 @@ class MultiAgentProcessor:
 
             logger.info(f"  ✓ {file_path.name}: {status} ({confidence:.0%}, {elapsed:.1f}s)")
             logger.debug(f"     Reasoning: {consensus_result.get('reasoning', 'N/A')[:80]}")
-            
+
             return invoice
-            
+
         except Exception as e:
             logger.error(f"  ✗ Chyba analýzy {file_path.name}: {e}")
             self.stats['errors'] += 1
-            
+
             # Vrátit alespoň základní invoice s chybou
             invoice.is_invoice = False
             invoice.confidence = 0.0
             invoice.decision_type = 'error'
             invoice.raw_json = {'error': str(e)}
             return invoice
+        
+        finally:
+            # Vždy uvolnit executor
+            if executor is not None:
+                executor.shutdown(wait=True)
+                executor = None
 
     def get_statistics(self) -> dict:
         """Vrátí statistiky zpracování."""
@@ -1310,14 +1323,14 @@ class InvoiceProcessorGUIV6(ctk.CTk):
 
                 # OCR extrakce
                 ocr_text = self.ocr_extractor.extract_text(file_path)
-                
+
                 if not ocr_text:
                     logger.warning(f"  ⚠️ Nepodařilo se extrahovat text: {file_path.name}")
                     continue
 
                 # Pravidlový předběžný filtr
                 pre_class, pre_conf, pre_reason = self.ocr_extractor.pre_filter(ocr_text)
-                
+
                 if pre_class == 'reject' and pre_conf > 0.9:
                     # Jisté zamítnutí - přeskočit AI
                     invoice = Invoice(
@@ -1328,24 +1341,35 @@ class InvoiceProcessorGUIV6(ctk.CTk):
                     )
                     invoice.raw_json = {'pre_filter': True, 'reason': pre_reason}
                     self.invoices.append(invoice)
-                    continue
+                else:
+                    # Multi-agent analýza
+                    invoice = self.agent_processor.analyze_document(ocr_text, file_path)
 
-                # Multi-agent analýza
-                invoice = self.agent_processor.analyze_document(ocr_text, file_path)
-                
-                if invoice:
-                    self.invoices.append(invoice)
-                    
-                    if invoice.requires_review:
-                        self.review_queue.append(invoice)
+                    if invoice:
+                        self.invoices.append(invoice)
 
-                # Memory management
+                        if invoice.requires_review:
+                            self.review_queue.append(invoice)
+
+                # Memory management - častější monitoring
                 if i % MEMORY_CHECK_EVERY == 0:
                     mem = get_memory_usage()
+                    logger.debug(f"💾 Paměť [{i}/{total}]: RSS={mem['rss_mb']:.1f}MB ({mem['percent']:.1f}%)")
+                    
                     if mem['percent'] > MAX_MEMORY_PERCENT:
-                        self.after(0, lambda: self.progress_label.configure(text="Uvolňování paměti..."))
+                        self.after(0, lambda: self.progress_label.configure(text="⚠️ Uvolňování paměti..."))
                         gc.collect()
                         log_memory_state("after_gc")
+                
+                # Agresivní GC každých 10 souborů
+                if i % GC_EVERY == 0:
+                    gc.collect()
+                    mem = get_memory_usage()
+                    logger.info(f"💾 GC po {i} souborech: RSS={mem['rss_mb']:.1f}MB ({mem['percent']:.1f}%)")
+
+            # Final GC před dokončením
+            gc.collect()
+            log_memory_state("before_finalization")
 
             # Hotovo
             stats = self.agent_processor.get_statistics()
