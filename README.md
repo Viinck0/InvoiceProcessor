@@ -717,7 +717,7 @@ Tento projekt je open-source a šířen pod licencí MIT.
 
 ---
 
-## 👨‍💻 Autor
+## 👨‍💻 Autor - Václav Krajkář
 
 Vytvořeno pro efektivní třídění faktur pomocí multi-agent AI workflow.
 
