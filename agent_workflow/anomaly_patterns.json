@@ -4,20 +4,12 @@
             "životopis",
             "curriculum vitae",
             "curriculum",
-            "cv ",
-            "narozen",
             "rodné číslo",
-            "bydliště",
-            "vzdělání",
-            "pracovní zkušenosti",
-            "praxe",
-            "zaměstnání",
-            "pracovní pozice",
-            "popis práce",
-            "reference",
-            "dovednosti",
-            "kompetence",
-            "kariéra"
+            "narozen",
+            "date of birth",
+            "birth date",
+            "social security number",
+            "ssn"
         ],
         "threshold": 2,
         "description": "Životopis nebo CV",
@@ -27,58 +19,46 @@
         "keywords": [
             "certifikát",
             "osvědčení",
-            "licence",
-            "akreditace",
             "absolvoval",
-            "ukončil",
             "úspěšně složil",
             "zkoušku",
-            "kurz",
-            "školení",
-            "seminář",
-            "vzdělávací program",
-            "profesní kvalifikace"
+            "profesní kvalifikace",
+            "certificate",
+            "certification",
+            "graduated",
+            "successfully passed",
+            "exam",
+            "professional qualification"
         ],
         "threshold": 2,
         "description": "Certifikát nebo osvědčení",
         "veto": true
     },
-    "education": {
-        "keywords": [
-            "ibm skillsbuild",
-            "skillsbuild",
-            "modul",
-            "kapitola",
-            "lekce",
-            "studijní materiál",
-            "vzdělávací obsah",
-            "e-learning",
-            "online kurz"
-        ],
-        "threshold": 1,
-        "description": "Vzdělávací materiál",
-        "veto": true
-    },
     "contract": {
         "keywords": [
-            "smlouva",
-            "dohoda",
-            "dodatek",
-            "nájemní smlouva",
             "pracovní smlouva",
+            "nájemní smlouva",
             "kupní smlouva",
-            "dodatková smlouva"
+            "employment contract",
+            "lease agreement",
+            "purchase agreement",
+            "non-disclosure agreement",
+            "nda"
         ],
         "threshold": 2,
-        "description": "Smlouva nebo dohoda",
+        "description": "Konkrétní typy smluv (ne obecné reference)",
         "veto": true
     },
     "reminder": {
         "keywords": [
             "upomínka",
-            "reminder",
             "výzva k úhradě",
-            "upomínací dopis"
+            "upomínací dopis",
+            "reminder",
+            "payment reminder",
+            "overdue notice",
+            "demand for payment",
+            "dunning letter"
         ],
         "threshold": 1,
         "description": "Upomínka (okamžitě zamítnout)",
@@ -87,52 +67,46 @@
     "offer": {
         "keywords": [
             "nabídka",
-            "offer",
             "cenová kalkulace",
             "rozpočet",
             "kalkulace nákladů",
-            "cenová nabídka"
+            "cenová nabídka",
+            "offer",
+            "quote",
+            "quotation",
+            "price estimate",
+            "budget",
+            "cost calculation",
+            "proposal"
         ],
         "threshold": 1,
         "description": "Nabídka nebo rozpočet",
         "veto": false
     },
-    "order": {
+    "inquiry": {
         "keywords": [
-            "objednávka",
-            "purchase order",
             "poptávka",
-            "objednávkový list"
+            "žádost o nabídku",
+            "inquiry",
+            "request for proposal",
+            "rfp",
+            "request for quote",
+            "rfq"
         ],
         "threshold": 1,
-        "description": "Objednávka",
-        "veto": false
-    },
-    "email": {
-        "keywords": [
-            "e-mail",
-            "email",
-            "dopis",
-            "korespondence",
-            "odesílatel",
-            "komu",
-            "předmět"
-        ],
-        "threshold": 2,
-        "description": "E-mail nebo dopis",
+        "description": "Poptávka",
         "veto": false
     },
     "internal": {
         "keywords": [
-            "interní",
-            "internal",
-            "pracovní",
             "koncept",
+            "návrh dokumentu",
+            "working copy",
             "draft",
-            "návrh dokumentu"
+            "document proposal"
         ],
         "threshold": 2,
-        "description": "Interní dokument",
+        "description": "Interní návrhy a koncepty",
         "veto": false
     }
 }

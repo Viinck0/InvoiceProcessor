@@ -18,43 +18,35 @@ class AnomalyDetectorAgent(BaseAgent):
     Specialized agent for detecting non-invoice documents.
     
     Detects:
-    - CVs and resumes
-    - Certificates and licenses
-    - Contracts and agreements
+    - CVs and resumes (CZ + EN)
+    - Certificates and licenses (CZ + EN)
+    - Specific Contracts and agreements
     - Reminders and offers
-    - Orders and purchase requests
-    - Emails and correspondence
+    - Inquiries and requests
     - Internal documents
     """
     
     DETECTION_PROMPT = """Jsi specialista na detekci anomálií v dokumentech. Tvým úkolem je identifikovat dokumenty, které NENÍ faktura.
 
 === TYPY ANOMÁLIÍ ===
-1. ŽIVOTOPIS/CV: obsahuje jméno, vzdělání, pracovní zkušenosti, dovednosti
-2. CERTIFIKÁT: obsahuje kurz, školení, absolvování, osvědčení, úspěšně složil
-3. SMLOUVA: obsahuje smluvní strany, paragrafy, podmínky
-4. UPOMÍNKA: obsahuje výzva k úhradě, upomínka, reminder
-5. NABÍDKA: obsahuje cenová nabídka, kalkulace, rozpočet
-6. OBJEDNÁVKA: obsahuje objednávka, purchase order, poptávka
-7. E-MAIL: obsahuje e-mailová komunikace, předmět, od/komu
-8. INTERNÍ DOKUMENT: obsahuje interní, pracovní koncept, návrh
-9. VZDĚLÁVACÍ MATERIÁL: obsahuje kurz, modul, kapitola, lekce, IBM SkillsBuild
+1. ŽIVOTOPIS/CV: dokument je čistý životopis (curriculum vitae, resume, vzdělání, praxe, dovednosti, education, experience, skills). POZOR: slova jako "školení" nebo "kurz" mohou být fakturované položky, ale seznam pracovních zkušeností je vždy anomálie!
+2. CERTIFIKÁT: osvědčení o absolvování (úspěšně složil, absolvoval, diplom, certificate, diploma, professional qualification). POZOR: faktura za "certifikaci" NENÍ anomálie!
+3. SMLOUVA: dokument je samotná smlouva (pracovní smlouva, nájemní smlouva, contract, agreement). POZOR: věty jako "fakturujeme dle smlouvy" nebo "na základě objednávky" jsou na fakturách normální!
+4. UPOMÍNKA: výzva k úhradě již splatné částky (upomínka, payment reminder).
+5. NABÍDKA/POPTÁVKA: dokument je teprve návrhem ceny (cenová nabídka, kalkulace, žádost o nabídku, quote, proposal).
+6. INTERNÍ DOKUMENT: nehotový dokument (koncept, draft, working copy).
 
 === PRAVIDLA ===
-- Pokud najdeš 2+ keyword pro daný typ → označ jako anomálii
-- UPOMÍNKA a NABÍDKA stačí 1 keyword
-- CERTIFIKÁT s "absolvoval", "kurz", "IBM SkillsBuild" → 1 keyword stačí
-- Pokud dokument vypadá jako faktura → is_anomaly=false
-
-=== DŮLEŽITÉ ===
-- Odpovídej POUZE ve formátu JSON
-- Žádný další text, žádné vysvětlení mimo JSON
-- Začni hned JSON objektem
+- Pokud dokument vypadá jako běžná faktura (obsahuje částky k úhradě, dodavatele, odběratele) → is_anomaly=false
+- NEZAMÍTEJ faktury jen proto, že obsahují slova "objednávka", "smlouva", "školení", "kurz" nebo "licence".
+- Odpovídej POUZE ve formátu JSON.
+- Žádný další text, žádné vysvětlení mimo JSON.
+- Začni hned JSON objektem.
 
 === FORMÁT VÝSTUPU ===
 {{
   "is_anomaly": true/false,
-  "anomaly_type": "cv_resume|certificate|contract|reminder|offer|order|email|internal|education|null",
+  "anomaly_type": "cv_resume|certificate|contract|reminder|offer|inquiry|internal|null",
   "confidence": 0.0-1.0,
   "detected_keywords": ["seznam nalezených keyword"],
   "flags": ["seznam varovných signálů"],
@@ -64,8 +56,8 @@ class AnomalyDetectorAgent(BaseAgent):
 === TEXT DOKUMENTU ===
 {input_data}"""
 
-    def __init__(self, model: str = "llama3.2", timeout: int = 30, patterns_file: Optional[str] = None):
-        super().__init__(model, timeout)
+    def __init__(self, model: str = "llama3.2", timeout: int = 30, patterns_file: Optional[str] = None, vram_limit_gb: int = None, num_ctx: int = None):
+        super().__init__(model, timeout, vram_limit_gb, num_ctx)
         self.patterns = self._load_patterns(patterns_file)
     
     def _load_patterns(self, patterns_file: Optional[str]) -> dict:
@@ -77,45 +69,72 @@ class AnomalyDetectorAgent(BaseAgent):
             except Exception as e:
                 logger.warning(f"Chyba načtení patternů: {e}")
         
-        # Default patterns (embedded fallback)
+        # VYLEPŠENÍ: Rozšířeno o EN termíny a specifická slova z životopisů
         return {
-            "reminder": {
-                "keywords": ["upomínka", "reminder", "výzva k úhradě"],
-                "threshold": 1,
-                "veto": True  # Immediate reject
-            },
-            "offer": {
-                "keywords": ["nabídka", "offer", "cenová kalkulace", "rozpočet"],
-                "threshold": 1,
-                "veto": False
-            },
             "cv_resume": {
-                "keywords": ["životopis", "curriculum", "vzdělání", "praxe", "narozen"],
+                "keywords": [
+                    "životopis", "curriculum vitae", "curriculum", "resume", "cv ", 
+                    "rodné číslo", "narozen", "date of birth", "birth date", 
+                    "dovednosti", "vzdělání", "pracovní zkušenosti", "praxe",
+                    "skills", "education", "experience", "work experience"
+                ],
                 "threshold": 2,
                 "veto": True
             },
             "certificate": {
-                "keywords": ["certifikát", "osvědčení", "absolvoval", "kurz", "školení"],
+                "keywords": [
+                    "certifikát", "osvědčení", "absolvoval", "úspěšně složil", "zkoušku", 
+                    "profesní kvalifikace", "certificate", "certification", "graduated", 
+                    "successfully passed", "exam", "professional qualification", "diplom", "diploma"
+                ],
                 "threshold": 2,
                 "veto": True
             },
             "contract": {
-                "keywords": ["smlouva", "dohoda", "dodatek", "nájemní"],
+                "keywords": [
+                    "pracovní smlouva", "nájemní smlouva", "kupní smlouva", "employment contract", 
+                    "lease agreement", "purchase agreement", "non-disclosure agreement", "nda",
+                    "dohoda", "agreement"
+                ],
                 "threshold": 2,
                 "veto": True
+            },
+            "reminder": {
+                "keywords": [
+                    "upomínka", "výzva k úhradě", "upomínací dopis", "reminder", 
+                    "payment reminder", "overdue notice", "demand for payment", "dunning letter"
+                ],
+                "threshold": 1,
+                "veto": True
+            },
+            "offer": {
+                "keywords": [
+                    "nabídka", "cenová kalkulace", "rozpočet", "kalkulace nákladů", "cenová nabídka", 
+                    "offer", "quote", "quotation", "price estimate", "budget", "cost calculation", "proposal"
+                ],
+                "threshold": 1,
+                "veto": False
+            },
+            "inquiry": {
+                "keywords": [
+                    "poptávka", "žádost o nabídku", "inquiry", "request for proposal", 
+                    "rfp", "request for quote", "rfq"
+                ],
+                "threshold": 1,
+                "veto": False
+            },
+            "internal": {
+                "keywords": [
+                    "koncept", "návrh dokumentu", "working copy", "draft", "document proposal"
+                ],
+                "threshold": 2,
+                "veto": False
             }
         }
     
     def analyze(self, text: str, metadata: Optional[dict] = None) -> dict:
         """
         Analyze document for non-invoice anomalies.
-        
-        Args:
-            text: Extracted text from document
-            metadata: Optional metadata (filename can hint at document type)
-            
-        Returns:
-            Anomaly detection result with type and confidence
         """
         # First, do fast rule-based detection
         rule_result = self._rule_based_detection(text, metadata)
@@ -125,14 +144,12 @@ class AnomalyDetectorAgent(BaseAgent):
             logger.debug(f"✓ Anomalie detekována pravidly: {rule_result['anomaly_type']}")
             return rule_result
         
-        # Otherwise, use AI for detailed analysis
         truncated = self._truncate_text(text, max_chars=5000)
         
         try:
             prompt = self.DETECTION_PROMPT.format(input_data=truncated)
         except (KeyError, IndexError) as e:
             logger.warning(f"Prompt format error: {e}")
-            # Fallback to rule-based only
             return rule_result
         
         try:
@@ -140,11 +157,15 @@ class AnomalyDetectorAgent(BaseAgent):
             response = client.generate(
                 model=self.model,
                 prompt=prompt,
+                format="json",
                 options={
-                    "temperature": 0.01,
-                    "num_predict": 256,
+                    "temperature": 0.0,
+                    "num_predict": 512,     # OPRAVA: Zvýšeno na 512, aby se neusekl reasoning a nezničil se JSON
+                    "num_ctx": self.num_ctx,
+                    "top_p": 0.1,
+                    "repeat_penalty": 1.1,
                 },
-                keep_alive="2m"
+                keep_alive="0s"
             )
             
             raw_output = response.get("response", "")
@@ -152,7 +173,6 @@ class AnomalyDetectorAgent(BaseAgent):
             
             if parsed is None:
                 logger.warning(f"Anomaly detector nevrátil JSON: {raw_output[:150]}...")
-                # Fallback to rule-based
                 return rule_result
             
             # Merge with rule-based results
@@ -169,16 +189,16 @@ class AnomalyDetectorAgent(BaseAgent):
     def _rule_based_detection(self, text: str, metadata: Optional[dict] = None) -> dict:
         """Fast rule-based anomaly detection."""
         text_lower = text.lower()
-        
+
         detected_anomalies = []
         all_keywords = []
-        
+
         for anomaly_type, config in self.patterns.items():
             keywords = config.get('keywords', [])
             threshold = config.get('threshold', 2)
-            
+
             found_keywords = [kw for kw in keywords if kw in text_lower]
-            
+
             if len(found_keywords) >= threshold:
                 detected_anomalies.append({
                     'type': anomaly_type,
@@ -188,7 +208,7 @@ class AnomalyDetectorAgent(BaseAgent):
                     'veto': config.get('veto', False)
                 })
                 all_keywords.extend(found_keywords)
-        
+
         if not detected_anomalies:
             return {
                 'is_anomaly': False,
@@ -198,25 +218,16 @@ class AnomalyDetectorAgent(BaseAgent):
                 'flags': [],
                 'reasoning': 'Žádné anomálie detekovány'
             }
-        
+
         # Sort by severity (veto types first)
         detected_anomalies.sort(key=lambda x: (x['veto'], x['count']), reverse=True)
         primary = detected_anomalies[0]
-        
+
         # Calculate confidence
         base_confidence = 0.7
         keyword_bonus = min(0.25, (primary['count'] - primary['threshold'] + 1) * 0.05)
         confidence = base_confidence + keyword_bonus
-        
-        # Check filename for additional hints
-        if metadata and 'filename' in metadata:
-            filename = metadata['filename'].lower()
-            for anomaly_type in ['životopis', 'certifikát', 'smlouva', 'upomínka', 'nabídka']:
-                if anomaly_type in filename:
-                    confidence = min(0.98, confidence + 0.1)
-                    if primary['type'] != anomaly_type.replace('ů', 'u').replace('í', 'i'):
-                        primary['type'] = anomaly_type.replace('ů', 'u').replace('í', 'i')
-        
+
         return {
             'is_anomaly': True,
             'anomaly_type': primary['type'],
@@ -228,9 +239,7 @@ class AnomalyDetectorAgent(BaseAgent):
     
     def _merge_results(self, rule_result: dict, ai_result: dict) -> dict:
         """Merge rule-based and AI results."""
-        # If both agree on anomaly
         if rule_result['is_anomaly'] and ai_result.get('is_anomaly'):
-            # Use AI's detailed analysis but keep rule-based confidence if higher
             confidence = max(rule_result['confidence'], ai_result.get('confidence', 0))
             return {
                 **ai_result,
@@ -241,22 +250,16 @@ class AnomalyDetectorAgent(BaseAgent):
                 ))
             }
         
-        # If rules say anomaly but AI disagrees
         if rule_result['is_anomaly'] and not ai_result.get('is_anomaly'):
-            # Trust rules if confidence is high
             if rule_result['confidence'] > 0.85:
                 return rule_result
-            # Otherwise, use AI with reduced confidence
             ai_result['confidence'] = ai_result.get('confidence', 0.5) * 0.8
             return ai_result
         
-        # If AI found anomaly but rules didn't
         if ai_result.get('is_anomaly') and not rule_result['is_anomaly']:
-            # Reduce confidence for AI-only detection
             ai_result['confidence'] = ai_result.get('confidence', 0.5) * 0.7
             return ai_result
         
-        # Both agree: no anomaly
         return {
             'is_anomaly': False,
             'anomaly_type': None,
