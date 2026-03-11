@@ -3,6 +3,9 @@
 # ─────────────────────────────────────────────
 # Instalace: pip install -r requirements.txt
 
+# YAML konfigurace pro externí pravidla (rules-as-data)
+PyYAML>=6.0
+
 # GUI pro invoice_gui.py a invoice_gui_v2.py (moderní dark theme UI)
 customtkinter>=5.2.0
 
@@ -33,3 +36,11 @@ psutil>=5.9.0
 
 # Standardní knihovny (součást Pythonu, není třeba instalovat):
 # os, re, sys, json, shutil, logging, pathlib, dataclasses, typing, threading, datetime, base64, io
+
+# ─── BEZPEČNOST (security.py) ───
+# Šifrování dat v rest (Fernet = AES-128-CBC + HMAC)
+cryptography>=41.0.0
+
+# Detekce MIME typů souborů (Windows varianta)
+# Na Linuxu použijte: python-magic>=0.4.27
+python-magic-bin>=0.4.14

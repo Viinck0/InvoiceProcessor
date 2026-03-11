@@ -1,0 +1,676 @@
+# Invoice Processing Rules Configuration
+# ======================================
+# This file contains all keywords, patterns, and regex rules for invoice processing.
+# Edit this file to tune accuracy without modifying Python code.
+#
+# Syntax:
+#   - keywords: list of strings (case-insensitive matching)
+#   - patterns: list of regex patterns
+#   - threshold: minimum number of keywords to trigger a rule
+#   - veto: if true, this rule can reject a document regardless of other scores
+
+# =============================================================================
+# CLASSIFIER AGENT - Document Type Classification
+# =============================================================================
+
+classifier:
+  # Strong negative indicators - immediate rejection if found
+  # OPRAVENO: Odstraněny výrazy pro nabídky, rozpočty a upomínky, aby nedocházelo k falešným zamítnutím.
+  strong_negative_indicators:
+    - 'plná moc'
+    - 'plnomocenství'
+    - 'dluhopis'
+    - 'cenný papír'
+    - 'akcie'
+    - 'kmenový list'
+    - 'směnka'
+    - 'životopis'
+    - 'životopisy'
+    - 'curriculum vitae'
+    - 'curriculum'
+    - 'resume'
+    - 'pracovní zkušenosti'
+    - 'vzdělání'
+    - 'dovednosti'
+    - 'jazykové znalosti'
+    - 'work experience'
+    - 'education'
+    - 'skills'
+    - 'professional profile'
+    - 'professional summary'
+    - 'career objective'
+    - 'core competencies'
+    - 'technical competencies'
+    - 'technical projects'
+    - 'professional working proficiency'
+    - 'certifikát o absolvování'
+    - 'diplom'
+    - 'osvědčení o absolvování'
+    # Přidáno pro detekci výzkumných zpráv a průzkumů (není faktura)
+    - 'mapování terénu'
+    - 'strategický pitch'
+    - 'průzkum českého'
+    - 'výzkumných skupin'
+    - 'pracovišť'
+    - 'český AI ekosystém'
+    - 'mapa české ai'
+    - 'tuzemského ekosystému'
+    - 'konzervativní umělé inteligence'
+    - 'explainable ai'
+    - 'medicínské ai'
+
+  # Context-dependent indicators - only reject if found without invoice context
+  context_negative_indicators:
+    narozen:
+      - 'rodné číslo'
+      - 'datum narození'
+      - 'narozen v'
+    born:
+      - 'birth date'
+      - 'date of birth'
+      - 'born in'
+    smlouva:
+      - 'fakturujeme za'
+      - 'faktura za'
+      - 'úhrada za'
+      - 'platba za'
+      - 'dle smlouvy' # OPRAVENO: Přidán běžný kontext
+      - 'číslo smlouvy' # OPRAVENO: Přidán běžný kontext
+    certifikát:
+      - 'fakturujeme za'
+      - 'faktura za'
+      - 'úhrada za'
+      - 'platba za'
+    licence:
+      - 'fakturujeme za'
+      - 'faktura za'
+      - 'úhrada za'
+      - 'platba za'
+    objednávka:
+      - 'faktura za'
+      - 'úhrada za'
+      - 'platba za'
+      - 'fakturujeme za'
+      - 'daňový doklad'
+      - 'číslo objednávky' # OPRAVENO: Přidán běžný kontext
+      - 'vaše objednávka' # OPRAVENO: Přidán běžný kontext
+    purchase order:
+      - 'invoice for'
+      - 'payment for'
+      - 'billing for'
+    # OPRAVENO: Přidána upomínka do kontextových indikátorů
+    upomínka:
+      - 'faktura'
+      - 'daňový doklad'
+      - 'v případě nedodržení'
+      - 'bude zaslána'
+    reminder:
+      - 'invoice'
+      - 'tax document'
+      - 'late payment'
+      - 'overdue'
+    # OPRAVENO: Přidána nabídka do kontextových indikátorů
+    nabídka:
+      - 'fakturujeme'
+      - 'faktura'
+      - 'dle schváleného'
+      - 'na základě'
+
+  # Fallback classification keywords (when AI fails)
+  fallback:
+    positive_keywords:
+      - 'faktura'
+      - 'daňový doklad'
+      - 'celkem k úhradě'
+      - 'invoice'
+      - 'tax document'
+      - 'total amount'
+      - 'total due'
+      - 'balance due'
+    negative_keywords:
+      - 'upomínka'
+      - 'smlouva'
+      - 'nabídka'
+      - 'životopis'
+      - 'certifikát'
+      - 'plná moc'
+      - 'plnomocenství'
+      - 'dluhopis'
+      - 'cenný papír'
+      - 'akcie'
+      - 'osvědčení'
+      - 'licence'
+      - 'absolvoval'
+      - 'kurz'
+      - 'školení'
+
+  # Regex patterns for title detection (non-invoice documents)
+  title_patterns:
+    - rf'^.*{indicator}.*$'
+    - rf'\n.*{indicator}.*\n'
+    - rf'{indicator}\s*č\.'
+    - rf'{indicator}\s*#'
+
+# =============================================================================
+# CONSENSUS ENGINE - Anomaly Detection & Validation
+# =============================================================================
+
+consensus_engine:
+  # Invoice keywords (Czech)
+  invoice_keywords_cs:
+    - 'faktura'
+    - 'faktúry'
+    - 'daňový doklad'
+    - 'zálohová faktura'
+    - 'konečná faktura'
+    - 'proforma'
+    - 'dodavatel'
+    - 'odběratel'
+    - 'objednatel'
+    - 'zhotovitel'
+    - 'poskytovatel'
+    - 'příjemce'
+    - 'ičo'
+    - 'dič'
+    - 'společnost'
+    - 'firma'
+    - 's.r.o.'
+    - 'a.s.'
+    - 'v.o.s.'
+    - 'datum vystavení'
+    - 'datum splatnosti'
+    - 'vystaveno'
+    - 'splatnost'
+    - 'du'
+    - 'dv'
+    - 'celkem'
+    - 'k úhradě'
+    - 'částka'
+    - 'cena'
+    - 'součet'
+    - 'úhrada'
+    - 'platba'
+    - 'bez dph'
+    - 'dpH'
+    - 'sazba'
+    - 'základ daně'
+    - 'variabilní symbol'
+    - 'konstantní symbol'
+    - 'specifický symbol'
+    - 'banka'
+    - 'účet'
+    - 'iban'
+    - 'bic'
+    - 'swift'
+    - 'kč'
+    - 'czk'
+    - 'eur'
+    - '€'
+    - 'usd'
+    - '$'
+    - 'gbp'
+    - '£'
+
+  # Invoice keywords (English)
+  invoice_keywords_en:
+    - 'invoice'
+    - 'tax document'
+    - 'proforma'
+    - 'bill'
+    - 'receipt'
+    - 'supplier'
+    - 'vendor'
+    - 'customer'
+    - 'buyer'
+    - 'seller'
+    - 'contractor'
+    - 'company'
+    - 'limited'
+    - 'inc.'
+    - 'corp.'
+    - 'gmbh'
+    - 'vat'
+    - 'tax id'
+    - 'registration no'
+    - 'issue date'
+    - 'due date'
+    - 'date of issue'
+    - 'dated'
+    - 'total'
+    - 'amount'
+    - 'price'
+    - 'sum'
+    - 'payment'
+    - 'balance'
+    - 'excl. vat'
+    - 'incl. vat'
+    - 'vat rate'
+    - 'tax base'
+    - 'subtotal'
+    - 'payment reference'
+    - 'bank account'
+    - 'account no'
+    - 'iban'
+    - 'bic'
+    - 'swift'
+    - 'eur'
+    - 'usd'
+    - 'gbp'
+    - 'czk'
+    - 'pln'
+    - 'huf'
+    - '€'
+    - '$'
+    - '£'
+
+  # Non-invoice document patterns for anomaly detection
+  non_invoice_patterns:
+    ticket:
+      - 'jízdenka'
+      - 'lístek'
+      - 'vstupenka'
+    cv_resume:
+      - 'životopis'
+      - 'praxe'
+      - 'dovednosti'
+      - 'vzdělání'
+      - 'cv'
+      - 'resume'
+      - 'curriculum'
+      - 'education'
+      - 'skills'
+      - 'experience'
+    certificate:
+      - 'certifikát'
+      - 'certifikat'
+      - 'osvědčení'
+      - 'certificate'
+    contract:
+      - 'smlouva'
+      - 'contract'
+      - 'dohoda'
+      - 'agreement'
+      - 'plná moc'
+      - 'plnomocenství'
+    offer:
+      - 'nabídka'
+      - 'offer'
+      - 'objednávka'
+      - 'order'
+      - 'licence'
+      - 'license'
+    research_report:
+      - 'průzkum'
+      - 'mapování'
+      - 'výzkumná zpráva'
+      - 'research report'
+      - 'survey'
+      - 'ekosystém'
+      - 'pracoviště'
+      - 'výzkumný tým'
+    other:
+      - 'poptávka'
+      - 'inquiry'
+      - 'ceník'
+      - 'price list'
+      - 'katalog'
+      - 'catalog'
+      - 'reklama'
+      - 'advertisement'
+      - 'leták'
+      - 'flyer'
+
+# =============================================================================
+# CORE ENGINE - Basic Document Filtering
+# =============================================================================
+
+core_engine:
+  # Basic invoice keywords for quick filtering
+  invoice_keywords:
+    - 'faktura'
+    - 'invoice'
+    - 'daňový doklad'
+    - 'receipt'
+    - 'bill'
+    - 'faktúra'
+    - 'účtenka'
+    - 'paragon'
+
+  # Non-invoice keywords for quick filtering
+  non_invoice_keywords:
+    - 'upomínka'
+    - 'reminder'
+    - 'výzva'
+    - 'notice'
+    - 'smlouva'
+    - 'contract'
+    - 'dohoda'
+    - 'agreement'
+    - 'nabídka'
+    - 'offer'
+    - 'objednávka'
+    - 'order'
+    - 'poznámka'
+    - 'note'
+    - 'zápis'
+    - 'minutes'
+    - 'vizitka'
+    - 'business card'
+    - 'reklama'
+    - 'advertisement'
+    - 'leták'
+    - 'flyer'
+    - 'prospekt'
+    - 'catalog'
+
+# =============================================================================
+# EXTRACTOR AGENT - Data Extraction Patterns
+# =============================================================================
+
+extractor_agent:
+  # Regex patterns for data extraction
+  patterns:
+    date: r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})'
+    amount: r'(\d{1,3}(?:[\s\.,]\d{3})*(?:[\s\.,]\d{1,2})?)'
+    ico: r'(?:ičo|ič|reg\.?\s*no\.?|company\s*no\.?|crn)\s*[:.]?\s*(\d{6,10})'
+    dic: r'(?:dič|vat\s*id|tax\s*id|vat\s*no\.?)\s*[:.]?\s*([a-zA-Z]{2}\d{8,12})'
+    account: r'(cz|sk)?\d{4,6}[- ]?\d{6,10}[- ]?\d{2,4}'
+    iban: r'iban:\s*([a-z]{2}\d{2,24})'
+
+  # Amount extraction patterns (super-regex)
+  amount_patterns:
+    - '(?:celkem\s*k\s*úhradě|celkemkuhrade|celkem|total|grand\s*total|amount\s*due|k\s*úhradě|k\s*zaplacení|částka\s*:)[\s]*(\d+(?:[\s,.]\d+)*)(?:\s*(Kč|EUR|USD|CZK|GBP|€|\$|£))?'
+    - r'(\d{1,3}(?:[\s,.]\d{3})*(?:,\d+)?)\s*(Kč|EUR|USD|CZK|GBP|€|\$|£)'
+
+  # Date extraction patterns
+  date_patterns:
+    - r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})'
+    - r'(\d{4})[./-](\d{1,2})[./-](\d{1,2})'
+    - r'(\d{1,2})\.\s*(\w+)\s*(\d{4})'
+    - r'(\w+)\s+(\d{1,2}),?\s+(\d{4})'
+
+  # Currency symbols and codes
+  currencies:
+    symbols: ['Kč', '€', '$', '£']
+    codes: ['CZK', 'EUR', 'USD', 'GBP', 'PLN', 'HUF']
+
+# =============================================================================
+# ANOMALY AGENT - Pattern Detection Rules
+# =============================================================================
+# Note: anomaly_patterns.json is loaded separately but can reference these rules
+
+anomaly_detection:
+  # CV/Resume detection - STEJNÁ SLOVA JAKO CLASSIFIER pro nezávislou validaci
+  cv_resume:
+    keywords:
+      - 'životopis'
+      - 'životopisy'
+      - 'curriculum vitae'
+      - 'curriculum'
+      - 'resume'
+      - 'pracovní zkušenosti'
+      - 'vzdělání'
+      - 'dovednosti'
+      - 'jazykové znalosti'
+      - 'work experience'
+      - 'education'
+      - 'skills'
+      - 'professional profile'
+      - 'professional summary'
+      - 'career objective'
+      - 'core competencies'
+      - 'technical competencies'
+      - 'technical projects'
+      - 'professional working proficiency'
+      - 'rodné číslo'
+      - 'narozen'
+      - 'date of birth'
+      - 'birth date'
+      - 'social security number'
+      - 'ssn'
+      - 'profesní zkušenosti'
+      - 'zaměstnání'
+      - 'praxe'
+      - 'absolvoval'
+      - 'ukončil'
+      - 'maturoval'
+      - 'vystudoval'
+    threshold: 1
+    veto: true
+
+  # Certificate detection - STEJNÁ SLOVA JAKO CLASSIFIER
+  certificate:
+    keywords:
+      - 'certifikát o absolvování'
+      - 'certifikát'
+      - 'osvědčení o absolvování'
+      - 'osvědčení'
+      - 'diplom'
+      - 'absolvoval'
+      - 'úspěšně složil'
+      - 'zkoušku'
+      - 'profesní kvalifikace'
+      - 'certificate'
+      - 'certification'
+      - 'graduated'
+      - 'successfully passed'
+      - 'diploma'
+      - 'degree'
+      - 'bachelor'
+      - 'master'
+      - 'doktor'
+      - 'phd'
+      - 'mgr'
+      - 'ing'
+      - 'bc'
+    threshold: 1
+    veto: true
+
+  # Contract detection - STEJNÁ SLOVA JAKO CLASSIFIER
+  contract:
+    keywords:
+      - 'smlouva'
+      - 'dohoda'
+      - 'pracovní smlouva'
+      - 'nájemní smlouva'
+      - 'kupní smlouva'
+      - 'rámcová smlouva'
+      - 'servisní smlouva'
+      - 'contract'
+      - 'agreement'
+      - 'lease agreement'
+      - 'employment contract'
+    threshold: 1
+    veto: false
+
+  # Reminder detection - STEJNÁ SLOVA JAKO CLASSIFIER
+  reminder:
+    keywords:
+      - 'upomínka'
+      - 'upomenutí'
+      - 'výzva k úhradě'
+      - 'výzva k zaplacení'
+      - 'reminder'
+      - 'payment reminder'
+      - 'dodatečná výzva'
+    threshold: 1
+    veto: true
+
+  # Offer/quote detection - STEJNÁ SLOVA JAKO CLASSIFIER
+  offer:
+    keywords:
+      - 'nabídka'
+      - 'cenová nabídka'
+      - 'kalkulace'
+      - 'rozpočet'
+      - 'nezávazná nabídka'
+      - 'předběžná kalkulace'
+      - 'offer'
+      - 'quote'
+      - 'quotation'
+      - 'estimate'
+      - 'budget'
+    threshold: 1
+    veto: true
+
+  # Inquiry/demand detection - STEJNÁ SLOVA JAKO CLASSIFIER
+  inquiry:
+    keywords:
+      - 'poptávka'
+      - 'výzva k podání nabídky'
+      - 'demand'
+      - 'inquiry'
+      - 'request for proposal'
+      - 'rfp'
+    threshold: 1
+    veto: true
+
+  # Internal documents - STEJNÁ SLOVA JAKO CLASSIFIER
+  internal:
+    keywords:
+      - 'interní'
+      - 'interní dokument'
+      - 'koncept'
+      - 'návrh'
+      - 'draft'
+      - 'internal'
+      - 'working document'
+    threshold: 1
+    veto: true
+
+  # Research report detection - STEJNÁ SLOVA JAKO CLASSIFIER
+  research_report:
+    keywords:
+      - 'mapování terénu'
+      - 'strategický pitch'
+      - 'průzkum českého'
+      - 'výzkumných skupin'
+      - 'pracovišť'
+      - 'český AI ekosystém'
+      - 'mapa české ai'
+      - 'tuzemského ekosystému'
+      - 'konzervativní umělé inteligence'
+      - 'explainable ai'
+      - 'medicínské ai'
+      - 'výzkumná zpráva'
+      - 'strategická zpráva'
+      - 'analytická zpráva'
+      - 'research report'
+      - 'study'
+      - 'analysis'
+    threshold: 1
+    veto: true
+
+  # Legal/financial documents - STEJNÁ SLOVA JAKO CLASSIFIER
+  legal_financial:
+    keywords:
+      - 'plná moc'
+      - 'plnomocenství'
+      - 'dluhopis'
+      - 'cenný papír'
+      - 'akcie'
+      - 'kmenový list'
+      - 'směnka'
+      - 'power of attorney'
+      - 'bond'
+      - 'security'
+      - 'share'
+      - 'stock'
+      - 'promissory note'
+    threshold: 1
+    veto: true
+
+# =============================================================================
+# OCR VALIDATOR - Text Quality Patterns
+# =============================================================================
+
+ocr_validator:
+  # Patterns that indicate OCR hallucinations
+  hallucination_patterns:
+    - r'^[aeiouyAEIOUY]{5,}$'  # Too many vowels
+    - r'^[^aeiouyAEIOUY\s]{5,}$'  # Too many consonants
+    - r'^[a-zA-Z]{1,2}$'  # Too short (1-2 chars)
+    - r'(.)\1{4,}'  # Repeated characters (aaaaa)
+    - r'^[0-9]+$'  # Pure numbers (likely page numbers)
+
+  # Valid word patterns (skip spell check)
+  valid_word_patterns:
+    - r'^\d{1,2}\.\d{1,2}\.\d{4}$'  # Date format
+    - r'^\d+[,.]\d{2}$'  # Numbers with decimals
+    - r'^[A-Z][a-z]+-[A-Z][a-z]+$'  # Compound words
+    - r'^\d+[a-z]$'  # Section markers (1a, 2b)
+    - r'^[IVXLC]+\.$'  # Roman numerals
+
+  # Long pattern corrections (OCR error fixes)
+  long_pattern_corrections:
+    - wrong: 'celkemkuhrade'
+      right: 'celkem k úhradě'
+    - wrong: 'celkemkúhradě'
+      right: 'celkem k úhradě'
+    - wrong: 'dodavatelodběratel'
+      right: 'dodavatel odběratel'
+    - wrong: 'ičo:'
+      right: 'IČO:'
+
+# =============================================================================
+# ELEMENT DETECTION - For Classification Validation
+# =============================================================================
+
+element_detection:
+  # Keywords that indicate document elements
+  identification:
+    - 'faktura'
+    - 'invoice'
+    - 'tax document'
+    - 'daňový doklad'
+
+  subjects:
+    - 'dodavatel'
+    - 'odběratel'
+    - 'objednatel'
+    - 'supplier'
+    - 'vendor'
+    - 'customer'
+    - 'bill to'
+    - 'ship to'
+    - 's.r.o.'
+    - 'a.s.'
+    - 'gmbh'
+    - 'ltd.'
+    - 'inc.'
+    - 'llc'
+    - 'b.v.'
+    - 'n.v.'
+    - 'ust-id'
+    - 'vat id'
+    - 'tax id'
+    - 'ico'
+    - 'dic'
+
+  dates:
+    - 'datum'
+    - 'splatnost'
+    - 'vystaveno'
+    - 'date'
+    - 'issued'
+    - 'due date'
+    - 'invoice date'
+
+  financial:
+    - 'celkem'
+    - 'částka'
+    - 'k úhradě'
+    - 'total'
+    - 'amount'
+    - 'price'
+    - 'subtotal'
+    - 'balance'
+
+  payment_info:
+    - 'účet'
+    - 'iban'
+    - 'bic'
+    - 'swift'
+    - 'bank account'
+    - 'account no'
+    - 'payment reference'

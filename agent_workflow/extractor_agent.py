@@ -2,12 +2,16 @@
 Extractor Agent
 Extract and validate invoice data fields
 
-OPTIMIZATIONS (v2):
-- Shorter, more strict prompt
-- Reduced context window for faster processing
-- Higher num_predict limit for complete JSON
-- Stronger JSON enforcement with examples
-- Two-stage extraction (quick fields first, then detailed)
+v7.5 (2026-03-04):
+- ARCHITECTURAL CHANGE: Agents receive ONLY Markdown data, NO raw text!
+- MARKDOWN-FIRST: Changed from JSON to Markdown output format
+- Agents work exclusively with:
+  1. Markdown table (structured data from text_blocks)
+  2. Master Instruction (fixed reference framework for validation)
+- Neprůstřelný regex parser pro Markdown tabulky nezávislý na přesných nadpisech.
+
+Uses external configuration from config/rules.yaml for regex patterns.
+Edit the YAML file to tune extraction rules without modifying this code.
 """
 
 from typing import Optional
@@ -15,398 +19,668 @@ import logging
 import re
 from .base_agent import BaseAgent
 
+# Import configuration loader
+try:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from config_loader import get_config
+    CONFIG = get_config()
+except Exception as e:
+    logging.warning(f"Config loader not available: {e}. Using built-in defaults.")
+    CONFIG = None
+
+# Import security sanitizer
+try:
+    from core.security import sanitize_llm_output
+    HAS_SECURITY = True
+except ImportError:
+    HAS_SECURITY = False
+
 logger = logging.getLogger(__name__)
 
 
 class ExtractorAgent(BaseAgent):
     """
     Specialized agent for invoice data extraction.
-    Optimized for speed and JSON compliance.
-
-    Extracts and validates:
-    - Vendor and customer names
-    - Invoice number
-    - Dates (issue, due)
-    - Amounts and currency
-    - Payment details
+    Optimized for speed and Markdown output compliance.
     """
 
-    # OPTIMIZED PROMPT - shorter, stricter, with examples
-    # v6.8: ANTI-HALLUCINATION - Removed template values, added validation instructions
-    EXTRACTION_PROMPT = """Jsi AI pro extrakci dat z faktur. VRAT POUZE JSON.
+    EXTRACTION_PROMPT = """Jsi AI pro extrakci dat z faktur. VRAT POUZE MARKDOWN.
+
+=== PRIMÁRNÍ ZDROJ DAT (HLAVNÍ PODKLAD) ===
+Tvým nejdůležitějším zdrojem je sekce "🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction)".
+Obsahuje text seřazený do logických bloků s označením pozice:
+* **[vlevo]**: Informace v levém sloupci (často dodavatel).
+* **[vpravo]**: Informace v pravém sloupci (často odběratel, datum, částka).
 
 === KRITICKÉ ANTI-HALUCINAČNÍ PRAVIDLO ===
 NESMÍŠ si VYMÝŠLET hodnoty! Extrahuj POUZE to, co je explicitně v textu.
 Pokud hodnotu nevidíš v textu, vrať null. NIKDY nepoužívej vzorové hodnoty!
+Jako dodavatele nebo odběratele NIKDY neextrahuj pouhý název města (např. "Praha", "Brno"). Musí jít o jméno firmy nebo osoby.
 
-ZAKÁZANÉ HODNOTY (pokud je vrátíš, je to halucinace):
-- vendor_name: "VZOROVY_DODAVATEL_sro", "VZOROVY_ODBERATEL_as" - toto jsou PŘÍKLADY!
-- issue_date: "2099-12-31", "2099-01-01" - toto jsou PŘÍKLADY!
-- total_amount: 99999.99, 80000.0 - toto jsou PŘÍKLADY!
-- bank_account: "111111111/1111" - toto je PŘÍKLAD!
+=== PRAVIDLA EXTRAKCE ===
+1. **Důslednost:** Extrahuj data přesně tak, jak jsou v dokumentu. Neměň diakritiku, pokud je v textu správně.
+2. **Dodavatel vs Odběratel:**
+   - Hledej v horní části dokumentu.
+   - Dodavatel je ten, kdo fakturu vystavil (často vlevo nahoře, označen jako "Dodavatel").
+   - Odběratel je ten, komu je fakturováno (často vpravo nahoře nebo uprostřed, označen jako "Odběratel").
+3. **Adresy - KLÍČOVÉ:**
+   - Adresa se skládá z ULICE + ČÍSLO POPISNÉ + MĚSTO + PSČ.
+   - Hledej řádky POD jménem dodavatele/odběratele ve STEJNÉM sloupci.
+   - Adresa může být rozdělena na více řádků (ulice na jednom řádku, město na dalším).
+   - Příklad: "Ulice 111" + "111Mesto-priklad" = plná adresa.
+   - NEextrahuj IČO/DIČ jako adresu!
+4. **Částka:** Extrahuj CELKOVOU částku k úhradě. Pokud je jich více, hledej slova jako "Celkem", "K úhradě", "Grand Total". Vytáhni pouze číslo.
+5. **Měna:** Extrahuj kód měny (CZK, EUR, atd.).
+6. **LOGISTICKÉ REPORTY (ZÁKAZ):** Pokud dokument vypadá jako report naskládání palet, seznam zboží v kamionu nebo jiný logistický výpis (obsahuje počty kusů, váhy, ale CHYBÍ jasný dodavatel, odběratel a ceny za položku) → VRAŤ PRÁZDNÁ POLE (null). Nepokoušej se mapovat kusy nebo váhy na částky faktury!
+7. **IGNOROVÁNÍ NÁPOVĚD V CHYBÁCH:** Sekce Validation Errors slouží jen pro skutečné problémy. NIKDY do ní nekopíruj text z instrukcí a nápověd (např. "k nalezení:").
 
-=== POSTUP EXTRAKCE ===
-1. Přečti si celý text dokumentu
-2. Pro KAŽDOU hodnotu kterou extrahuješ, musíš ji najít KONKRÉTNĚ v textu
-3. Pokud hodnotu nenajdeš, vrať null
-4. Extrahované hodnoty musí odpovídat tomu co je v dokumentu, ne příkladům!
+=== FORMÁT VÝSTUPU (STRIKTNÍ MARKDOWN) ===
+- ODPOVÍDEJ POUZE V MARKDOWN TABULKÁCH.
+- **ZÁKAZ JSONu:** Naprostý zákaz použití složených závorek {{}} nebo formátu JSON kdekoli ve výstupu (včetně reasoning).
+- Žádný doprovodný text mimo markdown.
+- **DŮLEŽITÉ:** Pokud do tabulky nebo textu potřebuješ napsat znak svislítka `|`, MUSÍŠ ho zapsat s lomítkem jako `\\|`.
 
-=== PRAVIDLA ===
-- Žádný text mimo JSON
-- Chybějící hodnoty = null (ne "unknown", ne "")
-- Částky jako čísla (bez měny)
-- Data jako YYYY-MM-DD
-- Žádné vysvětlování
+Použij PŘESNĚ následující strukturu:
 
-=== CO EXTRAKOVAT ===
-Hledej tyto hodnoty v textu:
-- invoice_number: Číslo faktury (např. "2026/001", "FV-123")
-- vendor_name: Název dodavatele (firma která účtuje)
-- customer_name: Název odběratele (komu se účtuje)
-- issue_date: Datum vystavení (formát DD.MM.YYYY nebo YYYY-MM-DD)
-- due_date: Datum splatnosti
-- total_amount: Celková částka k úhradě (číslo)
-- currency: Měna (CZK, EUR, USD)
-- vat_amount: Výše DPH (pokud je uvedena)
-- base_amount: Základ bez DPH (pokud je uveden)
-- bank_account: Číslo účtu (např. "123456789/0100")
-- variable_symbol: Variabilní symbol
-- vendor_ico: IČO dodavatele
-- vendor_dic: DIČ dodavatele
+## 📋 Extrahovaná data
+| Pole | Hodnota |
+|------|---------|
+| Invoice Number | číslo nebo null |
+| Vendor Name | název dodavatele nebo null |
+| Vendor Address | adresa dodavatele nebo null |
+| Customer Name | název odběratele nebo null |
+| Customer Address | adresa odběratele nebo null |
+| Issue Date | YYYY-MM-DD nebo null |
+| Due Date | YYYY-MM-DD nebo null |
+| Total Amount | číslo nebo null |
+| Currency | CZK/EUR/USD nebo null |
+| VAT Amount | číslo nebo null |
+| Base Amount | číslo nebo null |
+| Bank Account | účet nebo null |
+| Variable Symbol | VS nebo null |
+| Total Amount Raw | částka s měnou nebo null |
+| Vendor IČO | IČO nebo null |
+| Vendor DIČ | DIČ nebo null |
+| Customer IČO | IČO nebo null |
 
-=== VALIDACE ===
-Před vrácením zkontroluj:
-- Pokud total_amount je null, pak i vat_amount a base_amount musí být null
-- Pokud vendor_name je null, pak i vendor_ico a vendor_dic musí být null
-- Pokud nevidíš konkrétní hodnotu v textu, vrať null
+**Completeness Score:** 0.8
 
-=== JSON STRUKTURA ===
-{{"invoice_number":"číslo nebo null","vendor_name":"název dodavatele","customer_name":"název odběratele","issue_date":"YYYY-MM-DD","due_date":"YYYY-MM-DD","total_amount":číslo,"currency":"CZK","vat_amount":číslo,"base_amount":číslo,"bank_account":"účet","variable_symbol":"VS","total_amount_raw":"částka s měnou","vendor_ico":"IČO","vendor_dic":"DIČ","customer_ico":"IČO","completeness_score":0.0,"validation_errors":[]}}
+## ⚠️ Validation Errors
+- [Zde vypiš stručný seznam chybějících polí nebo problémů. Žádné nápovědy!]
 
-=== PŘÍKLAD SPRÁVNÉ EXTRAKCE ===
-Text: "Faktura č. 2026/001, Dodavatel: ABC s.r.o., Odběratel: XYZ a.s., Částka: 15000 Kč, Datum: 25.2.2026"
-Správná odpověď: {{"invoice_number":"2026/001","vendor_name":"ABC_sro","customer_name":"XYZ_as","issue_date":"2026-02-25","due_date":null,"total_amount":15000.0,"currency":"CZK","vat_amount":null,"base_amount":null,"bank_account":null,"variable_symbol":null,"total_amount_raw":"15000 Kč","vendor_ico":null,"vendor_dic":null,"customer_ico":null,"completeness_score":0.6,"validation_errors":["Chybí datum splatnosti"]}}
+## 🧠 Reasoning & Lokace
+[Stručný popis, kde jsi data našel v Master Instrukci - např. "Dodavatel nalezen v horním bloku [vlevo]...", "Adresa odběratele: řádky pod jménem ve sloupci [vpravo]: Ulice 777, 99955Mesto-priklad"]
+
+=== STRUKTURA VSTUPU ===
+1. 🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction): Tvůj HLAVNÍ zdroj pro pochopení struktury.
+2. 📋 Tabulka textových bloků: Přehledová tabulka (Cislo, Pozice, Text).
+3. 📜 VIZUALIZACE DOKUMENTU: Pokus o grafickou rekonstrukci vzhledu.
+4. SUROVÝ TEXT: Surová data dokumentu.
 
 {classifier_info}=== TEXT DOKUMENTU ===
-{input_data}"""  # OPRAVA: Změněno z {{input_data}} na {input_data}
-
-    # Validation patterns - VYLEPŠENÍ PRO EN: Přidána podpora pro mezinárodní formáty
-    DATE_PATTERN = r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})'  # Přidána podpora pro lomítka a pomlčky
-    AMOUNT_PATTERN = r'(\d{1,3}(?:[\s\.,]\d{3})*(?:[\s\.,]\d{1,2})?)'
-    ICO_PATTERN = r'(?:ičo|ič|reg\.?\s*no\.?|company\s*no\.?|crn)\s*[:.]?\s*(\d{6,10})' # Vylepšeno pro EN
-    DIC_PATTERN = r'(?:dič|vat\s*id|tax\s*id|vat\s*no\.?)\s*[:.]?\s*([a-zA-Z]{2}\d{8,12})' # Vylepšeno pro EN
-    ACCOUNT_PATTERN = r'(cz|sk)?\d{4,6}[- ]?\d{6,10}[- ]?\d{2,4}'
-    IBAN_PATTERN = r'iban:\s*([a-z]{2}\d{2,24})'
+{input_data}"""
 
     def __init__(self, model: str = "llama3.2", timeout: int = 60, vram_limit_gb: int = None, num_ctx: int = None):
-        """
-        Initialize Extractor Agent.
-
-        Args:
-            model: Ollama model name
-            timeout: Request timeout (increased to 60s for complex documents)
-            vram_limit_gb: VRAM limit in GB (optional)
-            num_ctx: Context window size (optional)
-        """
         super().__init__(model, timeout, vram_limit_gb, num_ctx)
-
-    def analyze(self, text: str, metadata: Optional[dict] = None) -> dict:
-        """
-        Extract invoice data from document text.
         
-        v6.9: Now accepts metadata from classifier to guide extraction
+        # Load regex patterns from external config
+        if CONFIG:
+            patterns = CONFIG.get_extractor_patterns()
+            self.date_pattern = patterns.get('date', r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})')
+            self.amount_pattern = patterns.get('amount', r'(\d{1,3}(?:[\s\.,]\d{3})*(?:[\s\.,]\d{1,2})?)')
+            self.ico_pattern = patterns.get('ico', r'(?:ičo|ič|reg\.?\s*no\.?|company\s*no\.?|crn)\s*[:.]?\s*(\d{6,10})')
+            self.dic_pattern = patterns.get('dic', r'(?:dič|vat\s*id|tax\s*id|vat\s*no\.?)\s*[:.]?\s*([a-zA-Z]{2}\d{8,12})')
+            self.account_pattern = patterns.get('account', r'(cz|sk)?\d{4,6}[- ]?\d{6,10}[- ]?\d{2,4}')
+            self.iban_pattern = patterns.get('iban', r'iban:\s*([a-z]{2}\d{2,24})')
+        else:
+            self.date_pattern = r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})'
+            self.amount_pattern = r'(\d{1,3}(?:[\s\.,]\d{3})*(?:[\s\.,]\d{1,2})?)'
+            self.ico_pattern = r'(?:ičo|ič|reg\.?\s*no\.?|company\s*no\.?|crn)\s*[:.]?\s*(\d{6,10})'
+            self.dic_pattern = r'(?:dič|vat\s*id|tax\s*id|vat\s*no\.?)\s*[:.]?\s*([a-zA-Z]{2}\d{8,12})'
+            self.account_pattern = r'(cz|sk)?\d{4,6}[- ]?\d{6,10}[- ]?\d{2,4}'
+            self.iban_pattern = r'iban:\s*([a-z]{2}\d{2,24})'
+
+    def analyze(self, markdown_input: str, metadata: Optional[dict] = None, master_instruction: Optional[str] = None) -> dict:
+        """
+        Extrahuje data z faktury.
+
+        ARCHITEKTURA: Agent dostává POUZE strukturovaná data:
+        - markdown_input: Markdown tabulka + layout (žádný surový text!)
+        - master_instruction: Pevný referenční rámec pro validaci
+        - metadata: Obsahuje text_blocks pro prostorovou extrakci
 
         Args:
-            text: Extracted text from document
-            metadata: Optional metadata containing classifier_reasoning
-
-        Returns:
-            Extracted data with completeness score
+            markdown_input: Strukturovaná Markdown data (tabulka + layout)
+            metadata: Dodatečná metadata (obsahuje text_blocks, classifier_elements, extracted_values)
+            master_instruction: Pevná instrukce pro validaci
         """
-        if not text or len(text.strip()) < 50:
+        if not markdown_input or len(markdown_input.strip()) < 50:
             return self._empty_result()
 
-        # v6.9: Check if classifier found specific elements
         classifier_hints = {}
-        classifier_found_elements = {}  # Track what classifier found (even if extraction failed)
-        
+        classifier_found_elements = {}
+        text_blocks = None
+        classifier_is_invoice = False
+        classifier_confidence = 0.0
+
         if metadata:
-            # Track what classifier found in elements_present
+            text_blocks = metadata.get('text_blocks')
             elements = metadata.get('classifier_elements', {})
             classifier_found_elements['supplier'] = elements.get('supplier_and_buyer_present', False)
             classifier_found_elements['customer'] = elements.get('supplier_and_buyer_present', False)
             classifier_found_elements['amount'] = elements.get('total_amount_present', False)
             classifier_found_elements['date'] = elements.get('date_present', False)
-            
-            # Prefer extracted_values from classifier (structured data)
+
+            # === KLÍČOVÉ: Získat informaci zda classifier dokument označil jako fakturu ===
+            classifier_is_invoice = metadata.get('classifier_is_invoice', False)
+            classifier_confidence = metadata.get('classifier_confidence', 0.0)
+
             extracted_values = metadata.get('extracted_values', {})
+            if extracted_values.get('supplier'): classifier_hints['vendor_name'] = extracted_values['supplier']
+            if extracted_values.get('customer'): classifier_hints['customer_name'] = extracted_values['customer']
+            if extracted_values.get('amount'): classifier_hints['total_amount_raw'] = extracted_values['amount']
+            if extracted_values.get('date'): classifier_hints['issue_date'] = extracted_values['date']
+            if extracted_values.get('document_type'): classifier_hints['document_type'] = extracted_values['document_type']
 
-            # Map classifier fields to extractor fields
-            if extracted_values.get('supplier'):
-                classifier_hints['vendor_name'] = extracted_values['supplier']
-            if extracted_values.get('customer'):
-                classifier_hints['customer_name'] = extracted_values['customer']
-            if extracted_values.get('amount'):
-                classifier_hints['total_amount_raw'] = extracted_values['amount']
-            if extracted_values.get('date'):
-                classifier_hints['issue_date'] = extracted_values['date']
-            if extracted_values.get('document_type'):
-                classifier_hints['document_type'] = extracted_values['document_type']
-
-            # Fallback: If no extracted_values, try to parse from reasoning
             if not classifier_hints and metadata.get('classifier_reasoning'):
                 reasoning = metadata.get('classifier_reasoning', '')
-
-                # Try to extract supplier and buyer from reasoning
                 if elements.get('supplier_and_buyer_present'):
                     supplier_match = re.search(r'Dodavatel\s*[-:]\s*([^,\n]+)', reasoning)
                     buyer_match = re.search(r'Odběratel\s*[-:]\s*([^,\n]+)', reasoning)
-                    if supplier_match:
-                        classifier_hints['vendor_name'] = supplier_match.group(1).strip()
-                    if buyer_match:
-                        classifier_hints['customer_name'] = buyer_match.group(1).strip()
-
+                    if supplier_match: classifier_hints['vendor_name'] = supplier_match.group(1).strip()
+                    if buyer_match: classifier_hints['customer_name'] = buyer_match.group(1).strip()
                 if elements.get('total_amount_present'):
                     amount_match = re.search(r'(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)', reasoning, re.IGNORECASE)
-                    if amount_match:
-                        classifier_hints['total_amount_raw'] = amount_match.group(0).strip()
-
+                    if amount_match: classifier_hints['total_amount_raw'] = amount_match.group(0).strip()
                 if elements.get('date_present'):
                     date_match = re.search(r'(\d{1,2}[-./]\d{1,2}[-./]\d{2,4})', reasoning)
-                    if date_match:
-                        classifier_hints['issue_date'] = date_match.group(0).strip()
+                    if date_match: classifier_hints['issue_date'] = date_match.group(0).strip()
 
-            logger.debug(f"  Classifier hints: {classifier_hints}")
-            logger.debug(f"  Classifier found elements: {classifier_found_elements}")
+        # === KRITICKÉ: Pokud classifier zamítl dokument s vysokou jistotou, extrakci přeskoč ===
+        if not classifier_is_invoice and classifier_confidence >= 0.85:
+            logger.info(f"  ⏭️ Extractor přeskočen: Classifier zamítl dokument (confidence: {classifier_confidence:.0%})")
+            return self._empty_result("Classifier zamítl dokument - extrakce přeskočena")
 
-        # OPTIMIZATION: Truncate to 4000 chars (was 6000) - sufficient for most invoices
-        truncated = self._truncate_text(text, max_chars=4000)
+        # Inteligentní krácení textu - zachovat důležité Markdown sekce
+        truncated = self._truncate_text_smart(markdown_input, max_chars=8000)
 
         try:
-            # Build classifier info for prompt
             classifier_info = ""
             if classifier_hints:
                 info_lines = []
-                if 'vendor_name' in classifier_hints:
-                    info_lines.append(f"- Dodavatel k nalezení: {classifier_hints['vendor_name']}")
-                if 'customer_name' in classifier_hints:
-                    info_lines.append(f"- Odběratel k nalezení: {classifier_hints['customer_name']}")
-                if 'total_amount_raw' in classifier_hints:
-                    info_lines.append(f"- Částka k nalezení: {classifier_hints['total_amount_raw']}")
-                if 'issue_date' in classifier_hints:
-                    info_lines.append(f"- Datum k nalezení: {classifier_hints['issue_date']}")
+                if 'vendor_name' in classifier_hints: info_lines.append(f"- Dodavatel k nalezení: {classifier_hints['vendor_name']}")
+                if 'customer_name' in classifier_hints: info_lines.append(f"- Odběratel k nalezení: {classifier_hints['customer_name']}")
+                if 'total_amount_raw' in classifier_hints: info_lines.append(f"- Částka k nalezení: {classifier_hints['total_amount_raw']}")
+                if 'issue_date' in classifier_hints: info_lines.append(f"- Datum k nalezení: {classifier_hints['issue_date']}")
                 if info_lines:
                     classifier_info = "\n".join(info_lines) + "\n\n"
 
-            # Add classifier info to prompt if available
-            if classifier_info:
-                # Insert classifier info into the prompt (before document text)
-                prompt = self.EXTRACTION_PROMPT.format(
-                    classifier_info=f"""=== DODATEČNÉ INFORMACE OD CLASSIFIERU ===
-{classifier_info}
-Použij tyto informace pro lepší extrakci - tyto hodnoty byly NALEZENY v textu. Hledej je!
+            master_instruction_section = f"=== MASTER INSTRUCTION (IMPORTANT) ===\n{master_instruction}\n\n" if master_instruction else ""
+            
+            base_prompt = self.EXTRACTION_PROMPT.replace(
+                "=== STRUKTURA VSTUPU ===",
+                master_instruction_section + "=== STRUKTURA VSTUPU ==="
+            )
 
-""",
-                    input_data=truncated
+            if classifier_info:
+                prompt = base_prompt.replace(
+                    "{classifier_info}", 
+                    f"=== DODATEČNÉ INFORMACE OD CLASSIFIERU ===\n{classifier_info}\nPoužij tyto informace pro lepší extrakci.\n\n"
+                ).replace(
+                    "{input_data}", truncated
                 )
             else:
-                prompt = self.EXTRACTION_PROMPT.format(
-                    classifier_info="",
-                    input_data=truncated
-                )
+                prompt = base_prompt.replace("{classifier_info}", "").replace("{input_data}", truncated)
+                
         except (KeyError, IndexError) as e:
             logger.warning(f"Prompt format error: {e}")
-            return self._fallback_extraction(text)
+            return self._fallback_extraction(markdown_input)
 
         try:
             client = self._get_client()
-
-            # OPTIMIZED PARAMETERS for speed and JSON compliance:
-            # v6.7: Použít num_ctx z nastavení agenta (z GUI)
             response = client.generate(
                 model=self.model,
                 prompt=prompt,
-                format="json",
                 options={
-                    "temperature": 0.0,     # v6.12: Deterministický výstup (převzato z čtečka/app.py)
+                    "temperature": 0.0,
                     "num_predict": 1024,
                     "num_ctx": self.num_ctx,
-                    "top_p": 0.1,           # v6.12: Omezený sampling pro lepší konzistenci
-                    "repeat_penalty": 1.1,  # Prevence opakování
+                    "top_p": 0.1,
+                    "repeat_penalty": 1.1,
                 },
-                keep_alive="0s"  # Okamžitě uvolnit paměť po requestu
+                keep_alive="0s"
             )
 
             raw_output = response.get("response", "")
-
-            # Debug: log raw output pro troubleshooting
             logger.debug(f"Extractor raw output ({len(raw_output)} chars): {raw_output[:300]}...")
 
-            # OPTIMIZATION: Try multiple JSON extraction strategies
-            parsed = self._extract_json_from_text(raw_output)
+            parsed = self._parse_markdown_output(raw_output)
 
             if parsed is None:
-                logger.warning(f"Extractor nevrátil JSON. Raw output preview: {raw_output[:200]}...")
-                # OPTIMIZATION: Try aggressive JSON fix before fallback
-                parsed = self._try_fix_json(raw_output)
+                logger.warning(f"Extractor nevrátil platný Markdown. Spouštím textový fallback.")
+                parsed = self._fallback_markdown_parse(raw_output)
                 if parsed is None:
-                    return self._fallback_extraction(text)
+                    return self._fallback_extraction(markdown_input)
 
-            # Validate and enhance extraction
-            result = self._validate_extraction(parsed, text)
+            result = self._validate_extraction(parsed, markdown_input)
+            
+            # === NOVÉ: Záchranná logika z textu reasoning/errors ===
+            result = self._post_process_recovery(result, raw_output)
 
-            # v6.9: Use classifier hints FIRST to fill in missing values
-            # This way, hint-filled values are available for verification
+            if text_blocks:
+                spatial_result = self._extract_from_text_blocks(text_blocks)
+                if spatial_result:
+                    for key, value in spatial_result.items():
+                        if value and not result.get(key):
+                            result[key] = value
+            else:
+                spatial_result = {}
+
             filled_fields = set()
             if classifier_hints:
-                result, filled_fields = self._fill_missing_with_hints(result, text, classifier_hints)
+                result, filled_fields = self._fill_missing_with_hints(result, markdown_input, classifier_hints)
             elif classifier_found_elements:
-                # Even if classifier didn't extract values, it found elements - try to extract them
-                logger.debug(f"  Classifier found elements but no hints - extracting from text...")
-                result = self._extract_with_classifier_guidance(result, text, classifier_found_elements)
-                # Mark these as "found" so they skip strict verification
+                result = self._extract_with_classifier_guidance(result, markdown_input, classifier_found_elements)
                 for elem in classifier_found_elements:
                     if classifier_found_elements[elem]:
                         filled_fields.add(elem.replace('supplier', 'vendor_name').replace('customer', 'customer_name'))
 
-            # v6.8: ANTI-HALLUCINATION - Verify only LLM-extracted values (not hint-filled ones)
-            # Also skip verification for fields where we found at least partial match in text
-            exclude_from_verify = filled_fields | set(classifier_hints.keys()) if classifier_hints else set()
-            result = self._verify_extraction(result, text, exclude_fields=exclude_from_verify)
+            # Exclude spatial and filled fields from verification (they may not match raw text exactly)
+            exclude_from_verify = filled_fields | set(classifier_hints.keys()) | set(spatial_result.keys()) if classifier_hints else set(spatial_result.keys())
+            result = self._verify_extraction(result, markdown_input, exclude_fields=exclude_from_verify)
 
-            # Calculate completeness
             result['completeness_score'] = self._calculate_completeness(result)
-
-            logger.debug(f"✓ Extrakce: completeness={result['completeness_score']:.0%}")
-
             return result
 
         except Exception as e:
             logger.error(f"Extractor chyba: {e}")
-            return self._fallback_extraction(text)
+            return self._fallback_extraction(markdown_input)
 
-    def _try_fix_json(self, raw_output: str) -> Optional[dict]:
-        """
-        Try to fix common JSON issues before falling back to rule-based extraction.
-        """
-        import json
+    def _parse_markdown_output(self, markdown_text: str) -> dict:
+        """Robustní parser Markdownu, nezávislý na přesných nadpisech nebo emoji."""
+        if not markdown_text or not markdown_text.strip():
+            return None
 
-        # Quick check: if no JSON-like structure at all, skip to Strategy 3
-        if '{' not in raw_output or '}' not in raw_output:
-            logger.debug("No JSON structure in output, skipping to Strategy 3")
-            return self._manual_extract_fields(raw_output)
+        result = self._empty_result()
+        has_data = False
 
-        # Strategy 1: Remove any text before first { and after last }
-        cleaned = raw_output.strip()
-        start = cleaned.find('{')
-        end = cleaned.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            candidate = cleaned[start:end + 1]
-            try:
-                return json.loads(candidate)
-            except:
-                pass
-        else:
-            # No JSON structure found, skip to Strategy 3
-            logger.debug("Strategy 1 failed: No JSON structure found")
-            return self._manual_extract_fields(raw_output)
+        # Preferuj parsování pouze tabulky "Extrahovaná data".
+        # Tím eliminujeme riziko, že parser omylem sebere jinou tabulku.
+        # Fallback: pokud sekci nenajdeme, parsujeme celý text (legacy).
+        def _extract_extracted_data_section(md: str) -> str:
+            m = re.search(r'(?is)##\s*[^\n]*extrahovan[áa]\s+data\s*\n(.*?)(?:\n##\s+|\Z)', md)
+            return (m.group(1).strip() if m else "")
 
-        # Strategy 2: Fix common issues - missing quotes, trailing commas
-        # Only run if we found a candidate in Strategy 1
-        if 'candidate' in locals():
-            fixed = re.sub(r'(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', candidate)
-            fixed = re.sub(r',\s*}', '}', fixed)  # Remove trailing commas
-            fixed = re.sub(r',\s*]', ']', fixed)
-            try:
-                return json.loads(fixed)
-            except:
-                pass
+        md_for_table = _extract_extracted_data_section(markdown_text)
+        if not md_for_table:
+            md_for_table = markdown_text
         
-        # Strategy 3: Try to extract key-value pairs manually
-        return self._manual_extract_fields(raw_output)
+        # 1. Extrakce dat z jakékoliv Markdown tabulky v textu (nejspolehlivější metoda)
+        # Hledáme řádky ve formátu: | Klíč | Hodnota |
+        table_rows = re.findall(r'\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|', md_for_table)
+        
+        key_mapping = {
+            'invoice number': 'invoice_number', 'číslo faktury': 'invoice_number',
+            'vendor name': 'vendor_name', 'dodavatel': 'vendor_name',
+            'vendor address': 'vendor_address', 'adresa dodavatele': 'vendor_address',
+            'customer name': 'customer_name', 'odběratel': 'customer_name',
+            'customer address': 'customer_address', 'adresa odběratele': 'customer_address',
+            'issue date': 'issue_date', 'datum vystavení': 'issue_date',
+            'due date': 'due_date', 'datum splatnosti': 'due_date',
+            'total amount': 'total_amount', 'celková částka': 'total_amount',
+            'currency': 'currency', 'měna': 'currency',
+            'vat amount': 'vat_amount', 'dph': 'vat_amount',
+            'base amount': 'base_amount', 'základ bez dph': 'base_amount',
+            'bank account': 'bank_account', 'číslo účtu': 'bank_account',
+            'variable symbol': 'variable_symbol', 'variabilní symbol': 'variable_symbol',
+            'total amount raw': 'total_amount_raw', 'částka s měnou': 'total_amount_raw',
+            'vendor ičo': 'vendor_ico', 'ičo dodavatele': 'vendor_ico', 'vendor ico': 'vendor_ico',
+            'vendor dič': 'vendor_dic', 'dič dodavatele': 'vendor_dic', 'vendor dic': 'vendor_dic',
+            'customer ičo': 'customer_ico', 'ičo odběratele': 'customer_ico', 'customer ico': 'customer_ico',
+        }
 
-    def _manual_extract_fields(self, raw_output: str) -> Optional[dict]:
-        """Manually extract key-value pairs from non-JSON output."""
-        result = {}
-        string_fields = ['invoice_number', 'vendor_name', 'customer_name',
-                        'issue_date', 'due_date', 'currency', 'total_amount_raw',
-                        'bank_account', 'variable_symbol', 'vendor_ico', 'vendor_dic', 'customer_ico']
-        number_fields = ['total_amount', 'vat_amount', 'base_amount', 'completeness_score']
-
-        # Strategy 1: Try JSON format first (with quotes)
-        for field in string_fields:
-            pattern = rf'"{field}"\s*:\s*"([^"]*)"'
-            match = re.search(pattern, raw_output)
-            if match:
-                result[field] = match.group(1) if match.group(1) != 'null' else None
-
-        for field in number_fields:
-            pattern = rf'"{field}"\s*:\s*([\d.]+)'
-            match = re.search(pattern, raw_output)
-            if match:
-                try:
-                    result[field] = float(match.group(1))
-                except:
-                    result[field] = None
-
-        # Strategy 2: Try list format (e.g., "- Invoice number: 2565021833")
-        # This handles cases where AI outputs data as a list instead of JSON
-        if not result.get('invoice_number'):
-            patterns_map = {
-                'invoice_number': [r'[-•]?\s*Invoice number[:\s]+([^\n]+)', r'[-•]?\s*Číslo faktury[:\s]+([^\n]+)'],
-                'vendor_name': [r'[-•]?\s*Vendor name[:\s]+([^\n]+)', r'[-•]?\s*Dodavatel[:\s]+([^\n]+)'],
-                'customer_name': [r'[-•]?\s*Customer name[:\s]+([^\n]+)', r'[-•]?\s*Odběratel[:\s]+([^\n]+)'],
-                'issue_date': [r'[-•]?\s*Issue date[:\s]+([^\n]+)', r'[-•]?\s*Datum vystavení[:\s]+([^\n]+)'],
-                'due_date': [r'[-•]?\s*Due date[:\s]+([^\n]+)', r'[-•]?\s*Datum splatnosti[:\s]+([^\n]+)'],
-                'total_amount': [r'[-•]?\s*Total amount[:\s]+([^\n]+)', r'[-•]?\s*Celkem[:\s]+([^\n]+)'],
-                'currency': [r'[-•]?\s*Currency[:\s]+([^\n]+)'],
-                'bank_account': [r'[-•]?\s*Bank account[:\s]+([^\n]+)', r'[-•]?\s*Účet[:\s]+([^\n]+)'],
-                'vendor_ico': [r'[-•]?\s*Vendor ICO[:\s]+([^\n]+)', r'[-•]?\s*IČO[:\s]+([^\n]+)'],
-                'vendor_dic': [r'[-•]?\s*Vendor DIC[:\s]+([^\n]+)', r'[-•]?\s*DIČ[:\s]+([^\n]+)'],
-            }
+        for col1, col2 in table_rows:
+            pole = col1.strip().lower()
+            value = col2.strip()
             
-            for field, field_patterns in patterns_map.items():
-                for pattern in field_patterns:
-                    match = re.search(pattern, raw_output, re.IGNORECASE)
-                    if match:
-                        value = match.group(1).strip()
-                        # Clean up value
-                        value = value.strip('-•: ')
-                        if value and value.lower() not in ['null', 'none', 'n/a']:
-                            if field == 'total_amount':
-                                # Try to extract number from value
-                                num_match = re.search(r'([\d\s,.]+)', value)
-                                if num_match:
-                                    try:
-                                        num_str = num_match.group(1).replace(' ', '').replace(',', '.')
-                                        result[field] = float(num_str)
-                                    except:
-                                        result[field] = value
-                            else:
-                                result[field] = value
+            # Přeskočit formátovací řádky tabulky (---) a hlavičky
+            if '---' in pole or pole in ['pole', 'field', 'klíč']:
+                continue
+                
+            # Najít správný klíč (s podporou částečné shody)
+            result_key = key_mapping.get(pole)
+            if not result_key:
+                for k, v in key_mapping.items():
+                    if k in pole:
+                        result_key = v
                         break
 
-        # Array field - validation errors
-        errors_match = re.search(r'"validation_errors"\s*:\s*\[([^\]]*)\]', raw_output)
-        if errors_match:
-            result['validation_errors'] = [e.strip().strip('"') for e in errors_match.group(1).split(',') if e.strip()]
-        else:
-            # If we found data, clear validation errors (they were false negatives)
-            if result:
-                result['validation_errors'] = []
-            else:
-                result['validation_errors'] = []
+            # Pokud klíč existuje a hodnota není prázdná
+            if result_key and value.lower() not in ['null', 'none', '—', '-', '', 'n/a']:
+                has_data = True
+                if result_key in ['total_amount', 'vat_amount', 'base_amount']:
+                    try:
+                        # Extrakce čistého čísla z řetězce, i když je tam nepořádek
+                        num_str = re.sub(r'[^\d,.]', '', value).replace(',', '.')
+                        # Ošetření tisícových oddělovačů (více teček)
+                        if num_str.count('.') > 1:
+                            parts = num_str.rsplit('.', 1)
+                            num_str = parts[0].replace('.', '') + '.' + parts[1]
+                        if num_str:
+                            result[result_key] = float(num_str)
+                    except ValueError:
+                        pass
+                else:
+                    result[result_key] = value
 
-        if result:  # If we extracted anything
+        # 2. Extrakce Completeness Score (Nezávisle na formátování jako ** nebo :)
+        score_match = re.search(r'(?i)completeness score[^\d]*([\d.]+)', markdown_text)
+        if score_match:
+            try:
+                result['completeness_score'] = float(score_match.group(1))
+            except ValueError:
+                pass
+
+        # 3. Extrakce chyb (Validation Errors) - S FILTREM PROTI PAPOUŠKOVÁNÍ
+        errors_section = re.split(r'(?i)validation errors', markdown_text)
+        if len(errors_section) > 1:
+            errors = re.findall(r'[-•*]\s*(.+)', errors_section[1])
+            cleaned_errors = []
+            for e in errors:
+                e_lower = e.strip().lower()
+                # Zahoď řádky, které obsahují jen otrocky zkopírované instrukce z promptu
+                if not e_lower or "seznam" in e_lower or "k nalezení:" in e_lower or "nápověd" in e_lower or "zde vypiš" in e_lower:
+                    continue
+                cleaned_errors.append(e.strip())
+            result['validation_errors'] = cleaned_errors
+            # 🔒 SECURITY: Sanitize validation errors to prevent injection
+            if HAS_SECURITY:
+                result['validation_errors'] = [sanitize_llm_output(e) for e in cleaned_errors]
+
+        # Pokud jsme z tabulky nic nedostali a skóre je 0, LLM vygenerovalo nesmysl
+        if not has_data and result['completeness_score'] == 0.0:
+            return None
+
+        return result
+
+    def _fallback_markdown_parse(self, raw_output: str) -> Optional[dict]:
+        """Záchrana v případě, že LLM nedodrží formát tabulky a vypíše seznam."""
+        result = {}
+        
+        patterns_map = {
+            'invoice_number': [r'[-•]?\s*Invoice number[:\s]+([^\n]+)', r'[-•]?\s*Číslo faktury[:\s]+([^\n]+)'],
+            'vendor_name': [r'[-•]?\s*Vendor name[:\s]+([^\n]+)', r'[-•]?\s*Dodavatel[:\s]+([^\n]+)'],
+            'customer_name': [r'[-•]?\s*Customer name[:\s]+([^\n]+)', r'[-•]?\s*Odběratel[:\s]+([^\n]+)'],
+            'issue_date': [r'[-•]?\s*Issue date[:\s]+([^\n]+)', r'[-•]?\s*Datum vystavení[:\s]+([^\n]+)'],
+            'due_date': [r'[-•]?\s*Due date[:\s]+([^\n]+)', r'[-•]?\s*Datum splatnosti[:\s]+([^\n]+)'],
+            'total_amount': [r'[-•]?\s*Total amount[:\s]+([^\n]+)', r'[-•]?\s*Celkem[:\s]+([^\n]+)'],
+            'currency': [r'[-•]?\s*Currency[:\s]+([^\n]+)'],
+            'bank_account': [r'[-•]?\s*Bank account[:\s]+([^\n]+)', r'[-•]?\s*Účet[:\s]+([^\n]+)'],
+            'vendor_ico': [r'[-•]?\s*Vendor ICO[:\s]+([^\n]+)', r'[-•]?\s*IČO[:\s]+([^\n]+)'],
+            'vendor_dic': [r'[-•]?\s*Vendor DIC[:\s]+([^\n]+)', r'[-•]?\s*DIČ[:\s]+([^\n]+)'],
+        }
+        
+        for field, field_patterns in patterns_map.items():
+            for pattern in field_patterns:
+                match = re.search(pattern, raw_output, re.IGNORECASE)
+                if match:
+                    value = match.group(1).strip().strip('-•: ')
+                    if value and value.lower() not in ['null', 'none', 'n/a']:
+                        if field == 'total_amount':
+                            num_match = re.search(r'([\d\s,.]+)', value)
+                            if num_match:
+                                try:
+                                    result[field] = float(num_match.group(1).replace(' ', '').replace(',', '.'))
+                                except:
+                                    pass
+                        else:
+                            result[field] = value
+                    break
+
+        if result:
+            result['validation_errors'] = []
             return result
 
         return None
 
-    def _validate_extraction(self, result: dict, original_text: str) -> dict:
-        """Validate and enhance extracted data using regex patterns."""
-        text_lower = original_text.lower()
+    def _extract_from_text_blocks(self, text_blocks: list) -> dict:
+        if not text_blocks: return {}
+        result = {}
 
-        # Ensure all expected fields exist
+        def _bbox_num(v, default=0.0):
+            try:
+                if isinstance(v, list):
+                    return float(v[0]) if v else float(default)
+                return float(v)
+            except Exception:
+                return float(default)
+
+        def _get_bbox(block):
+            bbox = block.get('bbox', {}) or {}
+            x0 = _bbox_num(bbox.get('x0', 0))
+            y0 = _bbox_num(bbox.get('y0', 0))
+            x1 = _bbox_num(bbox.get('x1', 0))
+            y1 = _bbox_num(bbox.get('y1', 0))
+            return x0, y0, x1, y1
+
+        def _clean_line(t: str) -> str:
+            t = (t or "").strip()
+            t = re.sub(r"\s+", " ", t)
+            return t
+
+        blocks = []
+        for b in text_blocks:
+            text = _clean_line(b.get('text', ''))
+            if not text or len(text) < 2:
+                continue
+            x0, y0, x1, y1 = _get_bbox(b)
+            blocks.append({"text": text, "text_lower": text.lower(), "x0": x0, "y0": y0, "x1": x1, "y1": y1})
+
+        if not blocks:
+            return {}
+
+        by_y = sorted(blocks, key=lambda b: b.get('y0', 0))
+        max_x = max((b.get('x1', 0) for b in blocks), default=600.0)
+        max_y = max((b.get('y1', 0) for b in blocks), default=800.0)
+        right_side_x = max_x * 0.6
+        left_side_x = max_x * 0.4
+        top_y = max_y * 0.3
+        
+        amount_keywords = ['celkem', 'úhradě', 'total', 'amount', 'částka', 'kč', 'eur', 'czk']
+        for block in blocks:
+            text = block.get('text_lower', '')
+            x0 = block.get('x0', 0)
+            if x0 > right_side_x:
+                amount_match = re.search(r'(\d+(?:[\s,.]\d+)*)\s*(kč|eur|usd|czk|€|\$|£)?', text, re.IGNORECASE)
+                if amount_match:
+                    amount_str = amount_match.group(1).strip()
+                    currency = amount_match.group(2) or ''
+                    y0 = block.get('y0', 0)
+                    for other in blocks:
+                        other_y = other.get('y0', 0)
+                        other_text = other.get('text_lower', '')
+                        if abs(other_y - y0) < 20:
+                            if any(kw in other_text for kw in amount_keywords):
+                                result['total_amount_raw'] = f"{amount_str} {currency}".strip()
+                                try:
+                                    result['total_amount'] = float(amount_str.replace(' ', '').replace(',', '.'))
+                                except: pass
+                                break
+        
+        date_pattern = r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})'
+        for block in by_y[:20]:
+            y0 = block.get('y0', 0)
+            if y0 > top_y: break
+            text = block.get('text', '')
+            date_match = re.search(date_pattern, text)
+            if date_match:
+                date_str = date_match.group(0)
+                for other in blocks:
+                    other_y = other.get('y0', 0)
+                    other_text = other.get('text_lower', '')
+                    if abs(other_y - y0) < 20:
+                        if 'vystaven' in other_text or 'issue' in other_text:
+                            result['issue_date'] = self._format_date(date_str)
+                        elif 'splatnost' in other_text or 'due' in other_text:
+                            result['due_date'] = self._format_date(date_str)
+                        else:
+                            if not result.get('issue_date'):
+                                result['issue_date'] = self._format_date(date_str)
+        
+        # Vendor/Customer + Address (multi-line) z levé i pravé části stránky.
+        supplier_keywords = ['dodavatel', 'supplier', 'vendor', 'odesílatel', 'seller', 'from']
+        customer_keywords = ['odběratel', 'customer', 'příjemce', 'objednatel', 'buyer', 'to', 'for']
+
+        def _looks_like_company_or_person(line: str) -> bool:
+            l = (line or "").strip()
+            if len(l) < 3:
+                return False
+            # Filtr proti samotnému městu
+            if re.fullmatch(r"[A-Za-zÁÉĚÍÓÚÝČĎŇŘŠŤŽáéěíóúýčďňřšťž\s\-]{3,}", l) and len(l.split()) <= 2:
+                # pokud je to jen 1-2 slova bez právní formy, je to často město
+                if not re.search(r"\b(s\.r\.o\.|a\.s\.|spol\.|ltd\b|inc\b|llc\b|gmbh\b|z\.s\.)\b", l, re.IGNORECASE):
+                    # může to být i jméno osoby, ale u faktur typicky bývá víc kontextu
+                    return len(l.split()) >= 2
+            return True
+
+        def _is_noise(line_lower: str) -> bool:
+            if not line_lower:
+                return True
+            if any(k in line_lower for k in ['faktura', 'invoice', 'daňový doklad', 'tax document']):
+                return True
+            return False
+
+        # Najdi labely a vezmi následující 1-4 řádky ve stejném sloupci
+        def _collect_entity(start_idx: int, left_bound: float, right_bound: float) -> list:
+            lines = []
+            base_y = by_y[start_idx]['y0']
+            base_x = by_y[start_idx]['x0']
+            # sbírej další řádky s rostoucím Y, dokud se výrazně neodskočí nebo nepřijde další label
+            for j in range(start_idx + 1, min(start_idx + 10, len(by_y))):
+                b = by_y[j]
+                if b['x0'] < left_bound or b['x0'] > right_bound:
+                    continue
+                dy = b['y0'] - base_y
+                if dy < -10:  # tolerance pro řádky se stejným Y (mohou být v jiném sloupci)
+                    continue
+                if dy > 160:
+                    break
+                t = b['text']
+                tl = b['text_lower']
+                if _is_noise(tl):
+                    continue
+                if any(kw in tl for kw in supplier_keywords) or any(kw in tl for kw in customer_keywords):
+                    break
+                if len(t.strip()) < 3:
+                    continue
+                lines.append(t.strip())
+                if len(lines) >= 4:
+                    break
+            return lines
+
+        def _find_next_line_in_column(start_idx: int, left_bound: float, right_bound: float, max_dy: float = 50) -> Optional[str]:
+            """Najde první další řádek ve stejném sloupci s tolerancí Y."""
+            base_y = by_y[start_idx]['y0']
+            for j in range(start_idx + 1, min(start_idx + 8, len(by_y))):
+                b = by_y[j]
+                if b['x0'] < left_bound or b['x0'] > right_bound:
+                    continue
+                dy = b['y0'] - base_y
+                if dy < -10 or dy > max_dy:
+                    continue
+                t = b['text'].strip()
+                if len(t) >= 2 and not _is_noise(b['text_lower']):
+                    return t
+            return None
+
+        def _extract_entity_from_column(blocks_list, start_idx, left_bound, right_bound, result_key_name, result_key_address):
+            """Univerzální funkce pro extrakci entity (dodavatel/odběratel) z daného sloupce."""
+            b = blocks_list[start_idx]
+            tl = b['text_lower']
+
+            if any(kw in tl for kw in supplier_keywords) or any(kw in tl for kw in customer_keywords):
+                # Nejprve zkus najít jméno hned pod labelem
+                next_line = _find_next_line_in_column(start_idx, left_bound, right_bound, max_dy=50)
+                if next_line and not result.get(result_key_name) and _looks_like_company_or_person(next_line):
+                    result[result_key_name] = next_line
+
+                # Pak zkus sbírat více řádků pro adresu
+                lines = _collect_entity(start_idx, left_bound, right_bound)
+                if lines:
+                    if not result.get(result_key_name) and _looks_like_company_or_person(lines[0]):
+                        result[result_key_name] = lines[0]
+                    if len(lines) > 1 and not result.get(result_key_address):
+                        # adresa = zbytek řádků (bez IČO/DIČ apod.)
+                        addr_lines = []
+                        for ln in lines[1:]:
+                            lnl = ln.lower()
+                            if re.search(r"\b(ič\s*o|ičo|dič|vat|iban|bic|swift|účet|account|tel\.|e-?mail)\b", lnl):
+                                continue
+                            addr_lines.append(ln)
+                        if addr_lines:
+                            result[result_key_address] = ", ".join(addr_lines)
+
+        # Hledání v levém sloupci (často dodavatel)
+        left_bound = 0.0
+        right_bound = left_side_x
+
+        # Speciální detekce: první řádek vlevo nahoře může být vendor_name
+        for i, b in enumerate(by_y[:10]):
+            if b['y0'] > max_y * 0.2:  # jen horních 20%
+                break
+            if b['x0'] > right_bound:
+                continue
+            text = b['text'].strip()
+            tl = b['text_lower']
+            # První řádek vlevo nahoře, který není hlavička faktury
+            if not _is_noise(tl) and 'isdoc' not in tl and 'faktura' not in tl:
+                if _looks_like_company_or_person(text) and not result.get('vendor_name'):
+                    result['vendor_name'] = text
+                    logger.debug(f"Vendor detekován z prvního řádku vlevo: {text}")
+                break
+
+        for i, b in enumerate(by_y[:80]):
+            if b['y0'] > max_y * 0.6:
+                break
+            if b['x0'] > right_bound:
+                continue
+            _extract_entity_from_column(by_y, i, left_bound, right_bound, 'vendor_name', 'vendor_address')
+            _extract_entity_from_column(by_y, i, left_bound, right_bound, 'customer_name', 'customer_address')
+
+        # Hledání v pravém sloupci (často odběratel)
+        right_column_left_bound = right_side_x
+        right_column_right_bound = max_x
+
+        for i, b in enumerate(by_y[:80]):
+            if b['y0'] > max_y * 0.6:
+                break
+            if b['x0'] < right_column_left_bound or b['x0'] > right_column_right_bound:
+                continue
+            _extract_entity_from_column(by_y, i, right_column_left_bound, right_column_right_bound, 'customer_name', 'customer_address')
+            _extract_entity_from_column(by_y, i, right_column_left_bound, right_column_right_bound, 'vendor_name', 'vendor_address')
+        
+        invoice_num_pattern = r'faktura\s*č\.?\s*[:.]?\s*([^\n]+)'
+        for block in by_y[:30]:
+            match = re.search(invoice_num_pattern, block.get('text', ''), re.IGNORECASE)
+            if match:
+                result['invoice_number'] = match.group(1).strip()
+                break
+        return result
+
+    def _format_date(self, date_str: str) -> Optional[str]:
+        try:
+            match = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})', date_str)
+            if match:
+                day, month, year = match.groups()
+                return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+        except: pass
+        return None
+
+    def _validate_extraction(self, result: dict, markdown_input: str) -> dict:
+        """Validuje extrahovaná data proti Markdown vstupu."""
+        markdown_lower = markdown_input.lower()
         expected_fields = [
             'invoice_number', 'vendor_name', 'vendor_ico', 'vendor_dic',
             'customer_name', 'customer_ico', 'issue_date', 'due_date',
@@ -418,144 +692,101 @@ Použij tyto informace pro lepší extrakci - tyto hodnoty byly NALEZENY v textu
             if field not in result:
                 result[field] = None
 
-        # Track if we found data in manual extraction (to avoid false validation errors)
-        had_manual_data = bool(result.get('invoice_number') or result.get('vendor_name') or result.get('customer_name'))
-
-        # Extract ICO if not found by AI
         if not result.get('vendor_ico'):
-            ico_match = re.search(self.ICO_PATTERN, text_lower)
-            if ico_match:
-                result['vendor_ico'] = ico_match.group(1)
+            ico_match = re.search(self.ico_pattern, markdown_lower)
+            if ico_match: result['vendor_ico'] = ico_match.group(1)
 
-        # Extract DIČ if not found by AI
         if not result.get('vendor_dic'):
-            dic_match = re.search(self.DIC_PATTERN, text_lower)
-            if dic_match:
-                result['vendor_dic'] = dic_match.group(1).upper()
+            dic_match = re.search(self.dic_pattern, markdown_lower)
+            if dic_match: result['vendor_dic'] = dic_match.group(1).upper()
 
-        # Extract bank account if not found by AI
         if not result.get('bank_account'):
-            iban_match = re.search(self.IBAN_PATTERN, text_lower)
+            iban_match = re.search(self.iban_pattern, markdown_lower)
             if iban_match:
                 result['bank_account'] = iban_match.group(1).upper()
             else:
-                account_match = re.search(self.ACCOUNT_PATTERN, text_lower)
-                if account_match:
-                    result['bank_account'] = account_match.group(0)
+                account_match = re.search(self.account_pattern, markdown_lower)
+                if account_match: result['bank_account'] = account_match.group(0)
 
-        # Detect currency
         if not result.get('currency'):
-            if '€' in original_text or 'eur' in text_lower:
-                result['currency'] = 'EUR'
-            elif '$' in original_text or 'usd' in text_lower:
-                result['currency'] = 'USD'
-            else:
-                result['currency'] = 'CZK'
+            if '€' in markdown_input or 'eur' in markdown_lower: result['currency'] = 'EUR'
+            elif '$' in markdown_input or 'usd' in markdown_lower: result['currency'] = 'USD'
+            else: result['currency'] = 'CZK'
 
-        # Validate dates (only if we have a date to validate)
-        if result.get('issue_date'):
-            result['issue_date'] = self._validate_date(result.get('issue_date'))
-        if result.get('due_date'):
-            result['due_date'] = self._validate_date(result.get('due_date'))
-
-        # Validate amounts (only if we have an amount to validate)
+        if result.get('issue_date'): result['issue_date'] = self._validate_date(result.get('issue_date'))
+        if result.get('due_date'): result['due_date'] = self._validate_date(result.get('due_date'))
         if result.get('total_amount') is not None:
             validated_amount = self._validate_amount(result.get('total_amount'))
-            if validated_amount is not None:
-                result['total_amount'] = validated_amount
+            if validated_amount is not None: result['total_amount'] = validated_amount
 
-        # Build validation errors - but be lenient if we found manual data
-        result['validation_errors'] = []
-        
-        if had_manual_data:
-            # If we found data through manual extraction, don't add validation errors
-            # for fields that might have different names in the document
-            logger.debug("  Manual extraction found data - skipping strict validation")
-            if not result.get('vendor_name'):
-                result['validation_errors'].append('Chybí dodavatel (možná jiný formát)')
-            if not result.get('customer_name'):
-                result['validation_errors'].append('Chybí odběratel (možná jiný formát)')
-        else:
-            # Strict validation for AI extraction
-            if not result.get('vendor_name'):
-                result['validation_errors'].append('Chybí dodavatel')
-            if not result.get('customer_name'):
-                result['validation_errors'].append('Chybí odběratel')
-
-        # Always add errors for truly missing critical fields
-        if not result.get('issue_date'):
-            result['validation_errors'].append('Chybí datum vystavení')
-        if result.get('total_amount') is None:
-            result['validation_errors'].append('Chybí částka')
+        if 'validation_errors' not in result:
+            result['validation_errors'] = []
 
         return result
     
     def _validate_date(self, date_value) -> Optional[str]:
-        """Validate and normalize date format."""
-        if not date_value:
-            return None
-
-        # If already in YYYY-MM-DD format
-        if re.match(r'\d{4}-\d{2}-\d{2}', str(date_value)):
-            # Validate the date components
+        """Převede datum do validního formátu (YYYY-MM-DD), i když obsahuje mezery."""
+        if not date_value: return None
+        
+        # Odstraníme veškeré mezery, abychom bez problému našli "26.2.2026" i když původně bylo "26. 2. 2026"
+        clean_date = re.sub(r'\s+', '', str(date_value))
+        
+        if re.match(r'\d{4}-\d{2}-\d{2}', clean_date):
             try:
-                match = re.match(r'(\d{4})-(\d{2})-(\d{2})', str(date_value))
+                match = re.match(r'(\d{4})-(\d{2})-(\d{2})', clean_date)
                 if match:
                     year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                    # Check if date is valid
-                    if month < 1 or month > 12:
-                        logger.debug(f"  Invalid month {month} in date {date_value}")
-                        return None
-                    if day < 1 or day > 31:
-                        logger.debug(f"  Invalid day {day} in date {date_value}")
-                        return None
-                    # Basic validation passed
-                    return date_value
-            except:
-                pass
-            return date_value
-
-        # Try to parse DD.MM.YYYY or MM/DD/YYYY
-        match = re.search(self.DATE_PATTERN, str(date_value))
-        if match:
-            return f"{match.group(3)}-{match.group(2).zfill(2)}-{match.group(1).zfill(2)}"
-
+                    if month < 1 or month > 12: return None
+                    if day < 1 or day > 31: return None
+                    return clean_date
+            except: pass
+            return clean_date
+            
+        match = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})', clean_date)
+        if match: return f"{match.group(3)}-{match.group(2).zfill(2)}-{match.group(1).zfill(2)}"
         return None
     
     def _validate_amount(self, amount_value) -> Optional[float]:
-        """Validate and normalize amount."""
-        if amount_value is None:
-            return None
-        
-        if isinstance(amount_value, (int, float)):
-            return float(amount_value)
-        
+        if amount_value is None: return None
+        if isinstance(amount_value, (int, float)): return float(amount_value)
         try:
-            # Remove spaces and handle Czech number format
-            cleaned = str(amount_value).replace(' ', '').replace(',', '.')
-            return float(cleaned)
-        except (ValueError, TypeError):
-            return None
+            return float(str(amount_value).replace(' ', '').replace(',', '.'))
+        except (ValueError, TypeError): return None
     
-    def _verify_extraction(self, result: dict, text: str, exclude_fields: set = None) -> dict:
-        """
-        v6.8: ANTI-HALLUCINATION - Verify that extracted values are actually in the text.
-        v6.9: RELAXED CHECK - Use substring matching instead of exact match to avoid false positives.
-        v6.9: SKIP VERIFICATION for fields filled from classifier hints.
-        v6.12: Removed verbose warnings - silent validation for cleaner logs.
-
-        Args:
-            result: Extracted data
-            text: Original document text
-            exclude_fields: Set of field names to skip verification for (filled from hints)
-
-        Returns:
-            Result with hallucinated values set to null
-        """
-        text_lower = text.lower()
+    def _verify_extraction(self, result: dict, markdown_input: str, exclude_fields: set = None) -> dict:
+        """Verifikuje že extrahovaná data jsou nalezena v Markdown vstupu."""
+        markdown_lower = markdown_input.lower()
         exclude_fields = exclude_fields or set()
 
-        # Check each extracted field with relaxed matching
+        # 🔒 SANITY CHECK: Blokování extrakce štítků místo hodnot
+        # Zakázané patterny pro vendor_name/customer_name - to jsou ŠTÍTKY ne hodnoty!
+        forbidden_label_patterns = [
+            r'^datum ', r'^datum$',  # "Datum účinnosti", "Datum transakce"
+            r'^číslo ', r'^číslo$',  # "Číslo faktury", "Číslo zákazníka"
+            r'^id ', r'^id$',        # "ID transakce", "ID zákazníka"
+            r'^daň', r'^dic', r'^ičo', r'^vat',  # "Daňové číslo", "DIČ", "IČO"
+            r'^variabilní', r'^konstantní', r'^symbol',  # "Variabilní symbol"
+            r'^e-mail', r'^email',   # "E-mail kupujícího"
+            r'^platební', r'^frekvence', r'^metoda',  # "Platební metoda"
+            r'^účinnosti', r'^transakce', r'^zákazníka', r'^kupujícího',  # Různé genitivy
+            r'^přidejte', r'^podrobnosti', r'^správ',  # "Přidejte podrobnosti"
+        ]
+
+        for field in ['vendor_name', 'customer_name', 'invoice_number']:
+            value = result.get(field)
+            if value:
+                value_lower = str(value).lower().strip()
+                # Check if value matches any forbidden pattern
+                for pattern in forbidden_label_patterns:
+                    if re.search(pattern, value_lower):
+                        logger.warning(f"Sanity Check: Blokována extrakce štítku '{value}' jako {field}")
+                        result[field] = None
+                        result['validation_errors'].append(f"{field} je štítek, ne hodnota")
+                        break
+                # Also check for very short values
+                if result.get(field) and len(str(result[field])) < 3:
+                    result[field] = None
+
         fields_to_check = [
             ('vendor_name', 'vendor_name'),
             ('customer_name', 'customer_name'),
@@ -564,81 +795,98 @@ Použij tyto informace pro lepší extrakci - tyto hodnoty byly NALEZENY v textu
         ]
 
         for field_key, _ in fields_to_check:
-            # Skip verification for fields filled from classifier hints
-            if field_key in exclude_fields:
-                continue
-
+            if field_key in exclude_fields: continue
             value = result.get(field_key)
             if value:
-                # Convert value to string and normalize
-                value_str = str(value)
+                value_str = str(value).strip()
+                if not value_str or value_str.lower() in ['null', 'none', 'n/a']:
+                    result[field_key] = None
+                    continue
+
                 value_lower = value_str.lower()
+                exact_match = value_lower in markdown_lower
 
-                # Check 1: Exact match (case insensitive)
-                exact_match = value_lower in text_lower
-
-                # Check 2: Substring match - at least 80% of value must be in text
-                # This handles cases where LLM adds extra formatting
                 if not exact_match:
-                    # Remove common suffixes and check core part
                     core_value = value_str.replace(' s.r.o.', '').replace(' a.s.', '').replace(' spol. s r.o.', '').strip()
-                    if len(core_value) > 3:
-                        core_match = core_value.lower() in text_lower
-                        if core_match:
-                            exact_match = True
+                    if len(core_value) > 3 and core_value.lower() in markdown_lower: exact_match = True
 
-                # Check 3: Word-by-word match for multi-word values
-                if not exact_match and len(value_str.split()) > 1:
-                    words = [w for w in value_str.split() if len(w) > 2 and w.lower() not in {'s.r.o.', 'a.s.', 'spol.', 'the'}]
+                if not exact_match:
+                    words = [w for w in value_str.split() if len(w) > 2 and w.lower() not in {'s.r.o.', 'a.s.', 'spol.', 'the', 'and', 'company'}]
                     if words:
-                        # Check if at least half of significant words are in text
-                        matches = sum(1 for w in words if w.lower() in text_lower)
-                        if matches >= len(words) * 0.5:
-                            exact_match = True
+                        significant_words = [w for w in words if len(w) >= 4]
+                        if significant_words:
+                            if sum(1 for w in significant_words if w.lower() in markdown_lower) > 0: exact_match = True
+                        else:
+                            if sum(1 for w in words if w.lower() in markdown_lower) >= len(words) * 0.5: exact_match = True
 
-                # If no match found, silently set to null
+                if not exact_match and any(c.isdigit() for c in value_str):
+                    digits = "".join(filter(str.isdigit, value_str))
+                    if len(digits) >= 4 and digits in markdown_input.replace(" ", "").replace("-", ""): exact_match = True
+
                 if not exact_match:
                     result[field_key] = None
-                    result['validation_errors'].append(f"{field_key} nebyl nalezen v textu")
+                    result['validation_errors'].append(f"{field_key} nebyl nalezen v Markdown")
 
-        # Check dates - must be in format from text
-        issue_date = result.get('issue_date')
-        if issue_date and issue_date != '0000-00-00':
-            # Check if date pattern exists in text (not the exact date, just any date pattern)
-            import re
-            date_patterns = [
-                r'\d{1,2}[./-]\d{1,2}[./-]\d{4}',  # Podpora DD.MM.YYYY i DD/MM/YYYY
-                r'\d{4}-\d{2}-\d{2}',              # YYYY-MM-DD
-            ]
-            date_found = any(re.search(pattern, text) for pattern in date_patterns)
-            if not date_found:
-                result['issue_date'] = None
-                result['validation_errors'].append("issue_date nebyl nalezen v textu")
+        # === Důkladná validace vendor_name a customer_name proti halucinacím ===
+        for name_field in ['vendor_name', 'customer_name']:
+            if name_field in exclude_fields:
+                continue
+            value = result.get(name_field)
+            if value:  # Only validate if not already blocked by sanity check
+                value_str = str(value).strip()
+                validation_error = self._validate_name_field(value_str, markdown_input)
+                if validation_error:
+                    result[name_field] = None
+                    result['validation_errors'].append(validation_error)
 
-        # Check amounts - must be numeric value from text
-        total_amount = result.get('total_amount')
-        if total_amount is not None and total_amount > 0:
-            # Check if amount pattern exists in text
-            amount_str = str(total_amount).replace('.', ',')
-            amount_found = (
-                str(total_amount) in text or
-                amount_str in text or
-                f"{int(total_amount)}" in text or
-                f"{int(total_amount):,}" in text.replace(' ', '') or
-                f"{int(total_amount):.2f}" in text
-            )
-            if not amount_found:
-                result['total_amount'] = None
-                result['vat_amount'] = None  # Also clear VAT if no total
-                result['base_amount'] = None
-                result['validation_errors'].append("total_amount nebyl nalezen v textu")
+        # === Validace adres - musí vypadat jako adresa ===
+        for addr_field in ['vendor_address', 'customer_address']:
+            if addr_field in exclude_fields:
+                continue
+            value = result.get(addr_field)
+            if value:
+                value_str = str(value).strip()
+                validation_error = self._validate_address_field(value_str, markdown_input)
+                if validation_error:
+                    result[addr_field] = None
+                    result['validation_errors'].append(validation_error)
 
-        # Check for template/example values (common hallucinations) - silent check
+        # OPRAVA 1: Kontrola data pouze pokud není chráněno v exclude_fields
+        if 'issue_date' not in exclude_fields:
+            issue_date = result.get('issue_date')
+            if issue_date and issue_date != '0000-00-00':
+                date_found = False
+                try:
+                    y, m, d = issue_date.split('-')
+                    if (f"{int(d)}" in markdown_lower or f"{d.zfill(2)}" in markdown_lower) and \
+                       (f"{int(m)}" in markdown_lower or f"{m.zfill(2)}" in markdown_lower):
+                        date_found = True
+                except:
+                    pass
+                if not date_found:
+                    date_found = any(re.search(p, markdown_input) for p in [r'\d{1,2}[./-]\d{1,2}[./-]\d{2,4}', r'\d{4}[./-]\d{1,2}[./-]\d{1,2}'])
+                if not date_found:
+                    result['issue_date'] = None
+                    result['validation_errors'].append("issue_date nebyl nalezen v Markdown")
+
+        # OPRAVA 2: Kontrola částky pouze pokud není chráněna v exclude_fields
+        if 'total_amount' not in exclude_fields:
+            total_amount = result.get('total_amount')
+            if total_amount is not None and total_amount > 0:
+                amount_str = str(total_amount).replace('.', ',')
+                markdown_normalized = markdown_input.replace(" ", "").replace(",", ".").lower()
+                amount_val_str = f"{total_amount:.2f}".rstrip('0').rstrip('.')
+                amount_found = (str(total_amount) in markdown_input or amount_str in markdown_input or amount_val_str in markdown_normalized or str(int(total_amount)) in markdown_input)
+                if not amount_found:
+                    result['total_amount'] = None
+                    result['vat_amount'] = None
+                    result['base_amount'] = None
+                    result['validation_errors'].append("total_amount nebyl nalezen v Markdown")
+
         TEMPLATE_VALUES = [
             'vzorovy_dodavatel', 'vzorovy_odberatel', 'vzor', 'example',
             '2099-12-31', '2099-01-01', '99999', '111111111',
         ]
-
         for field in ['vendor_name', 'customer_name', 'invoice_number', 'bank_account']:
             value = result.get(field)
             if value and any(tv in value.lower() for tv in TEMPLATE_VALUES):
@@ -647,302 +895,340 @@ Použij tyto informace pro lepší extrakci - tyto hodnoty byly NALEZENY v textu
 
         return result
 
+    def _validate_name_field(self, value: str, original_text: str) -> Optional[str]:
+        """
+        Validuje, že extracted name vypadá jako skutečné jméno firmy/osoby.
+        Vrací chybovou hlášku nebo None pokud je vše v pořádku.
+        """
+        if not value or len(value.strip()) < 2:
+            return f"{value} je prázdný"
+
+        value = value.strip()
+
+        # 1. Délka - jméno firmy by nemělo být extrémně dlouhé
+        if len(value) > 150:
+            return f"{value[:50]}... je příliš dlouhé (max 150 znaků)"
+
+        # 2. Nesmí obsahovat větné zlomky (koncové čárky, tečky uprostřed, spojky na konci)
+        if value.endswith(',') or value.endswith('.'):
+            return f"{value} končí interpunkcí (větný zlomek)"
+
+        # 3. Nesmí obsahovat spojky na začátku nebo konci (typické pro vytržený text)
+        first_word = value.split()[0].lower() if value.split() else ''
+        last_word = value.split()[-1].lower() if value.split() else ''
+        forbidden_starts = ['a', 'i', 'že', 'který', 'která', 'které', 'zde', 'tento', 'tato', 'toto', 'ten', 'ta', 'to']
+        forbidden_ends = ['a', 'i', 'že', 'se', 'si', 'je', 'by', 'v', 'na', 'o', 'u', 'k', 's', 'z']
+        if first_word in forbidden_starts:
+            return f"{value} začíná spojkou/zájmenem"
+        if last_word in forbidden_ends and len(last_word) <= 2:
+            return f"{value} končí krátkou spojkou"
+
+        # 4. Detekce zda to není ve skutečnosti adresa místo jména
+        # Pokud obsahuje PSČ (3-5 číslic) nebo ulici s číslem popisným, je to podezřelé
+        has_postal_code = bool(re.search(r'\b\d{3}\s?\d{2}\b', value))
+        has_street_address = bool(re.search(r'\b\d{1,4}\b', value)) and any(kw in value.lower() for kw in ['ulice', 'ul.', 'náměstí', 'nám.', 'třída', 'tř.', 'hlavní', 'masarykova'])
+        if has_postal_code or (has_street_address and len(value.split()) >= 4):
+            return f"{value[:50]}... vypadá jako adresa, ne jméno firmy/osoby"
+
+        # 5. Nesmí obsahovat více než 5 čísel (jména firem je obvykle nemají, kromě IČO atd.)
+        # Ale povolíme více pokud jsou součástí názvu (např. "Firma 2025")
+        digit_count = sum(c.isdigit() for c in value)
+        digit_sequences = re.findall(r'\d+', value)
+        if digit_count > 8 or len(digit_sequences) > 3:
+            return f"{value} obsahuje příliš čísel (možná adresa nebo jiný údaj)"
+
+        # 6. Musí obsahovat alespoň jedno písmeno
+        if not any(c.isalpha() for c in value):
+            return f"{value} neobsahuje písmena"
+
+        # 7. Kontrola proti "město pouze" - pokud je to jen 1-2 slova bez právní formy
+        words = value.split()
+        if 1 <= len(words) <= 2:
+            # Pokud to vypadá jako město (velké písmeno, žádné s.r.o., a.s., atd.)
+            if not re.search(r'\b(s\.r\.o\.|a\.s\.|spol\.|ltd|inc|llc|gmbh|z\.s\.|v\.o\.s\.|k\.s\.)\b', value, re.IGNORECASE):
+                # Zkontroluj jestli to není jen obecné podstatné jméno
+                common_nouns = ['ústav', 'skupina', 'pracoviště', 'firma', 'společnost', 'instituce', 'organizace', 'kategorie', 'mapa', 'pitch', 'průzkum', 'ekosystém']
+                value_lower = value.lower()
+                if any(noun in value_lower for noun in common_nouns):
+                    return f"{value} je obecný pojem, ne jméno firmy"
+
+        # 8. Nesmí obsahovat slova typická pro popisný text
+        descriptive_words = ['často', 'ale', 'však', 'zde', 'tam', 'který', 'jenž', 'že', 'protože', 'jakmile', 'když', 'pokud', 'třeba', 'konkrétně', 'silně', 'silněji']
+        value_lower = value.lower()
+        if any(word in value_lower for word in descriptive_words):
+            return f"{value[:50]}... obsahuje popisná slova"
+
+        # 9. Musí být nalezen v textu jako celek nebo s malými úpravami
+        text_lower = original_text.lower()
+        value_lower = value.lower()
+        if value_lower not in text_lower:
+            # Zkusit najít alespoň významnou část
+            core_value = re.sub(r'\s*(s\.r\.o\.|a\.s\.|spol\.|ltd|inc|llc|gmbh)\s*', '', value_lower, flags=re.IGNORECASE).strip()
+            if len(core_value) > 5 and core_value not in text_lower:
+                return f"{value} nebyl nalezen v textu"
+
+        return None
+
+    def _validate_address_field(self, value: str, original_text: str) -> Optional[str]:
+        """
+        Validuje, že extracted address vypadá jako skutečná adresa.
+        Vrací chybovou hlášku nebo None pokud je vše v pořádku.
+        """
+        if not value or len(value.strip()) < 3:
+            return f"{value} je příliš krátké"
+
+        value = value.strip()
+
+        # 1. Délka - adresa by neměla být extrémně dlouhá
+        if len(value) > 250:
+            return f"{value[:50]}... je příliš dlouhé (max 250 znaků)"
+
+        # 2. Adresa typicky obsahuje číslo popisné nebo PSČ
+        # Czech PSČ pattern: 3-5 číslic na začátku nebo v textu
+        has_czech_postal_code = bool(re.search(r'\b\d{3}\s?\d{2}\b', value))
+        has_house_number = bool(re.search(r'\b\d{1,4}\b', value))  # číslo popisné
+        has_street_keywords = any(kw in value.lower() for kw in ['ulice', 'ul.', 'náměstí', 'nám.', 'třída', 'tř.', 'street', 'avenue', 'road'])
+
+        # Adresa by měla mít alespoň nějaký strukturní prvek
+        is_likely_address = has_czech_postal_code or has_house_number or has_street_keywords
+
+        # 3. Nesmí končit čárkou nebo tečkou (větný zlomek)
+        if value.endswith(',') or value.endswith('.'):
+            return f"{value} končí interpunkcí (větný zlomek)"
+
+        # 4. Kontrola proti popisnému textu - věty bez adresních prvků jsou podezřelé
+        word_count = len(value.split())
+        if word_count > 15 and not is_likely_address:
+            return f"{value[:50]}... je příliš dlouhá věta bez adresních prvků"
+
+        # 5. Nesmí obsahovat spojky na začátku
+        first_word = value.split()[0].lower() if value.split() else ''
+        forbidden_starts = ['a', 'i', 'že', 'který', 'která', 'které', 'zde', 'tento', 'tato', 'toto', 'ten', 'ta', 'to', 'diverzifikuje', 'propojuje', 'razí', 'nesnaží']
+        if first_word in forbidden_starts:
+            return f"{value} začíná spojkou/slovesem"
+
+        # 6. Detekce "příliš mnoho čísel" - ale ignoruj PSČ a čísla popisná
+        # Správná adresa může mít 2-3 čísla (PSČ, číslo popisné, číslo orientační)
+        digit_sequences = re.findall(r'\d+', value)
+        # Pokud má více než 4 samostatných číselných sekvencí, je to podezřelé
+        # ALE: pokud vypadají jako PSČ+číslo domu, je to OK
+        if len(digit_sequences) > 5 and not has_czech_postal_code:
+            return f"{value} obsahuje příliš mnoho číselných sekvencí"
+
+        # 7. Kontrola zda to není jen seznam IČO/DIČ bez skutečné adresy
+        ico_dic_pattern = re.search(r'\b(ičo|ič|dič|vat|dic)\s*[:.]?\s*\d', value.lower())
+        if ico_dic_pattern and not has_house_number and not has_street_keywords:
+            # Pokud obsahuje jen IČO/DIČ bez ulice nebo čísla, není to adresa
+            # Ale pokud je tam i něco jiného, může to být součást adresy
+            non_ico_text = re.sub(r'\b(ičo|ič|dič|vat|dic)\s*[:.]?\s*\d+\b', '', value, flags=re.IGNORECASE).strip()
+            if len(non_ico_text) < 5:
+                return f"{value} obsahuje pouze IČO/DIČ bez skutečné adresy"
+
+        # 8. Musí být nalezen v textu (alespoň část)
+        text_lower = original_text.lower()
+        value_lower = value.lower()
+        if value_lower not in text_lower:
+            # Zkusit najít alespoň významnou část adresy
+            # Odstraníme IČO/DIČ pro kontrolu
+            core_address = re.sub(r'\b(ičo|ič|dič|vat|dic)\s*[:.]?\s*\d+\b', '', value_lower, flags=re.IGNORECASE).strip()
+            core_address = re.sub(r'\s+', ' ', core_address)
+            if len(core_address) > 8 and core_address not in text_lower:
+                # Zkusit najít alespoň část adresy (ulice nebo město)
+                words = core_address.split()
+                significant_words = [w for w in words if len(w) > 3]
+                if significant_words:
+                    found_count = sum(1 for w in significant_words if w in text_lower)
+                    if found_count < len(significant_words) * 0.5:
+                        return f"{value[:50]}... nebyla nalezena v textu"
+
+        return None
+
     def _calculate_completeness(self, result: dict) -> float:
-        """Calculate completeness score based on extracted fields."""
         required_fields = ['vendor_name', 'customer_name', 'issue_date', 'total_amount']
         optional_fields = ['invoice_number', 'due_date', 'currency', 'vendor_ico', 'bank_account']
-        
         score = 0.0
-        
-        # Required fields (60% of score)
         for field in required_fields:
-            if result.get(field):
-                score += 0.15
-        
-        # Optional fields (40% of score)
+            if result.get(field): score += 0.15
         for field in optional_fields:
-            if result.get(field):
-                score += 0.08
-        
+            if result.get(field): score += 0.08
         return min(1.0, score)
     
     def _fill_missing_with_hints(self, result: dict, text: str, hints: dict) -> tuple:
-        """
-        v6.9: Fill missing values using classifier hints.
-
-        When LLM returns null for fields that classifier found, use regex
-        to search for the hinted values directly in the text.
-
-        Args:
-            result: Extracted data from LLM
-            text: Original document text
-            hints: Values found by classifier
-
-        Returns:
-            Tuple (result, filled_fields) where filled_fields is a set of field names that were filled
-        """
         text_lower = text.lower()
         filled_fields = set()
 
-        # Fill vendor_name if missing but hinted
         if not result.get('vendor_name') and hints.get('vendor_name'):
             hinted_value = hints['vendor_name']
-            # Search for the hinted value in text (case insensitive)
             if hinted_value.lower() in text_lower:
-                # Find the exact occurrence with original casing
-                pattern = re.escape(hinted_value)
-                match = re.search(pattern, text, re.IGNORECASE)
+                match = re.search(re.escape(hinted_value), text, re.IGNORECASE)
                 if match:
                     result['vendor_name'] = match.group(0)
-                    logger.debug(f"  ✓ Filled vendor_name from hint: {result['vendor_name']}")
                     filled_fields.add('vendor_name')
-                    # Remove related validation error
-                    result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                   if 'dodavatel' not in e.lower()]
             else:
-                # Strategy 2: Extract key words from hint and search for them
-                # "firma XYZ" → search for "XYZ"
                 words = hinted_value.split()
-                # Take the most distinctive word (not "firma", "s.r.o.", etc.)
                 stop_words = {'firma', 's.r.o.', 'a.s.', 'spol.', 's', 'r.o.', 'o', 'z.s.', 'ič'}
                 key_words = [w for w in words if w.lower() not in stop_words and len(w) > 2]
-
                 for key_word in key_words:
-                    # Search for the key word as a whole word
-                    pattern = r'\b' + re.escape(key_word) + r'\b'
-                    match = re.search(pattern, text, re.IGNORECASE)
+                    match = re.search(r'\b' + re.escape(key_word) + r'\b', text, re.IGNORECASE)
                     if match:
-                        # Found a key word - use it as vendor name
                         result['vendor_name'] = match.group(0)
-                        logger.debug(f"  ✓ Filled vendor_name from hint (keyword '{key_word}'): {result['vendor_name']}")
                         filled_fields.add('vendor_name')
-                        result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                       if 'dodavatel' not in e.lower()]
                         break
 
-        # Fill customer_name if missing but hinted (same strategy)
         if not result.get('customer_name') and hints.get('customer_name'):
             hinted_value = hints['customer_name']
             if hinted_value.lower() in text_lower:
-                pattern = re.escape(hinted_value)
-                match = re.search(pattern, text, re.IGNORECASE)
+                match = re.search(re.escape(hinted_value), text, re.IGNORECASE)
                 if match:
                     result['customer_name'] = match.group(0)
-                    logger.debug(f"  ✓ Filled customer_name from hint: {result['customer_name']}")
                     filled_fields.add('customer_name')
-                    result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                   if 'odběratel' not in e.lower()]
             else:
                 words = hinted_value.split()
                 stop_words = {'firma', 's.r.o.', 'a.s.', 'spol.', 's', 'r.o.', 'o', 'z.s.', 'ič'}
                 key_words = [w for w in words if w.lower() not in stop_words and len(w) > 2]
-
                 for key_word in key_words:
-                    pattern = r'\b' + re.escape(key_word) + r'\b'
-                    match = re.search(pattern, text, re.IGNORECASE)
+                    match = re.search(r'\b' + re.escape(key_word) + r'\b', text, re.IGNORECASE)
                     if match:
                         result['customer_name'] = match.group(0)
-                        logger.debug(f"  ✓ Filled customer_name from hint (keyword '{key_word}'): {result['customer_name']}")
                         filled_fields.add('customer_name')
-                        result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                       if 'odběratel' not in e.lower()]
                         break
 
-        # Fill issue_date if missing but hinted
         if not result.get('issue_date') and hints.get('issue_date'):
             hinted_date = hints['issue_date']
-            # Try to find the date in text in various formats
-            date_patterns = [
-                re.escape(hinted_date),  # Exact match
-                hinted_date.replace('.', r'[./-]'),  # Flexible separators
-                hinted_date.replace('-', r'[./-]'),
-            ]
+            date_patterns = [re.escape(hinted_date), hinted_date.replace('.', r'[./-]'), hinted_date.replace('-', r'[./-]')]
             for pattern in date_patterns:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
-                    # Normalize to YYYY-MM-DD
-                    found_date = match.group(0)
-                    normalized = self._validate_date(found_date)
+                    normalized = self._validate_date(match.group(0))
                     if normalized:
                         result['issue_date'] = normalized
-                        logger.debug(f"  ✓ Filled issue_date from hint: {hinted_date} → {normalized}")
                         filled_fields.add('issue_date')
-                        result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                       if 'datum' not in e.lower()]
                     break
 
-        # Fill total_amount if missing but hinted
         if not result.get('total_amount') and hints.get('total_amount_raw'):
             hinted_amount = hints['total_amount_raw']
-            # Extract numeric value from hinted amount
             amount_match = re.search(r'(\d+(?:[\s,.]\d+)*)', hinted_amount)
             if amount_match:
                 amount_str = amount_match.group(1).replace(' ', '').replace(',', '.')
                 try:
                     result['total_amount'] = float(amount_str)
                     result['total_amount_raw'] = hinted_amount
-                    logger.debug(f"  ✓ Filled total_amount from hint: {hinted_amount} → {result['total_amount']}")
                     filled_fields.add('total_amount')
-                    result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                   if 'částka' not in e.lower()]
-                except ValueError:
-                    pass
+                except ValueError: pass
 
         return result, filled_fields
 
     def _extract_with_classifier_guidance(self, result: dict, text: str, found_elements: dict) -> dict:
-        """
-        v6.9: Extract values from text when classifier found elements but didn't extract specific values.
-        
-        This handles the case where classifier says "supplier found" but extracted_values is null.
-        We use regex to find the values directly in the text.
-        
-        Args:
-            result: Current extraction result
-            text: Original document text
-            found_elements: Dict of elements that classifier found (True/False)
-            
-        Returns:
-            Result with extracted values
-        """
-        text_lower = text.lower()
-        
-        # Extract supplier if classifier found it
         if found_elements.get('supplier') and not result.get('vendor_name'):
-            # Look for common patterns
-            patterns = [
-                r'dodavatel[:\s]+([^,\n]+)',
-                r'vendor[:\s]+([^,\n]+)',
-                r'from[:\s]+([^,\n]+)',
-            ]
-            for pattern in patterns:
+            for pattern in [r'dodavatel[:\s]+([^,\n]+)', r'vendor[:\s]+([^,\n]+)', r'from[:\s]+([^,\n]+)']:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     result['vendor_name'] = match.group(1).strip()
-                    logger.debug(f"  ✓ Extracted vendor_name: {result['vendor_name']}")
-                    result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                   if 'dodavatel' not in e.lower()]
                     break
         
-        # Extract customer if classifier found it
         if found_elements.get('customer') and not result.get('customer_name'):
-            patterns = [
-                r'odběratel[:\s]+([^,\n]+)',
-                r'customer[:\s]+([^,\n]+)',
-                r'for[:\s]+([^,\n]+)',
-                r'faktura pro[:\s]+([^,\n]+)',
-            ]
-            for pattern in patterns:
+            for pattern in [r'odběratel[:\s]+([^,\n]+)', r'customer[:\s]+([^,\n]+)', r'for[:\s]+([^,\n]+)', r'faktura pro[:\s]+([^,\n]+)']:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     result['customer_name'] = match.group(1).strip()
-                    logger.debug(f"  ✓ Extracted customer_name: {result['customer_name']}")
-                    result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                   if 'odběratel' not in e.lower()]
                     break
         
-        # Extract amount if classifier found it
         if found_elements.get('amount') and not result.get('total_amount'):
-            # Look for amount patterns with currency
-            patterns = [
-                r'celkem[:\s]+(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)',
-                r'total[:\s]+(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)',
-                r'k úhradě[:\s]+(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)',
-                r'(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)',
-            ]
-            for pattern in patterns:
+            for pattern in [r'celkem[:\s]+(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)', r'total[:\s]+(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)', r'k úhradě[:\s]+(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)', r'(\d+(?:[\s,.]\d+)*)\s*(Kč|EUR|USD|CZK)']:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
-                    amount_str = match.group(1).replace(' ', '').replace('.', '').replace(',', '.')
                     try:
-                        result['total_amount'] = float(amount_str)
+                        result['total_amount'] = float(match.group(1).replace(' ', '').replace('.', '').replace(',', '.'))
                         result['total_amount_raw'] = f"{match.group(1)} {match.group(2)}"
-                        logger.debug(f"  ✓ Extracted total_amount: {result['total_amount']}")
-                        result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                       if 'částka' not in e.lower()]
                         break
-                    except ValueError:
-                        pass
+                    except ValueError: pass
         
-        # Extract date if classifier found it
         if found_elements.get('date') and not result.get('issue_date'):
-            # Look for date patterns
-            patterns = [
-                r'datum vystavení[:\s]+(\d{1,2}\.\d{1,2}\.\d{4})',
-                r'issue date[:\s]+(\d{1,2}\.\d{1,2}\.\d{4})',
-                r'(\d{1,2}\.\d{1,2}\.\d{4})',
-                r'(\d{4}-\d{2}-\d{2})',
-            ]
-            for pattern in patterns:
+            for pattern in [r'datum vystavení[:\s]+(\d{1,2}\.\d{1,2}\.\d{4})', r'issue date[:\s]+(\d{1,2}\.\d{1,2}\.\d{4})', r'(\d{1,2}\.\d{1,2}\.\d{4})', r'(\d{4}-\d{2}-\d{2})']:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
-                    found_date = match.group(0)
-                    normalized = self._validate_date(found_date)
+                    normalized = self._validate_date(match.group(0))
                     if normalized:
                         result['issue_date'] = normalized
-                        logger.debug(f"  ✓ Extracted issue_date: {normalized}")
-                        result['validation_errors'] = [e for e in result.get('validation_errors', [])
-                                                       if 'datum' not in e.lower()]
                         break
-        
         return result
 
+    def _post_process_recovery(self, result: dict, raw_output: str) -> dict:
+        """
+        Záchranná logika: Pokud některé klíčové pole chybí v tabulce, ale LLM ho vypsalo
+        v sekci 'Reasoning' nebo 'Validation Errors', pokusíme se ho odtud vytáhnout.
+        """
+        # 1. Hledání DATUMU (např. "Datum k nalezení: 26. 2. 2026")
+        if not result.get('issue_date'):
+            # Hledání v celém textu: "datum" -> libovolné znaky (ne dvojtečka) -> dvojtečka/mezera -> datum
+            # Odstraněna nebezpečná nested kvantifikace (?:...)+
+            date_match = re.search(r'(?i)datum[^:]*[:\s]+(\d{1,2}[\s.]+\d{1,2}[\s.]+\d{4})', raw_output)
+            if not date_match:
+                 # Fallback na jakýkoliv formát data v textu u kterého je "datum"
+                 date_match = re.search(r'(?i)datum[^:]*[:\s]+([0-9.\-/]{6,10})', raw_output)
+            
+            if date_match:
+                normalized = self._validate_date(date_match.group(1))
+                if normalized:
+                    result['issue_date'] = normalized
+                    logger.debug(f"  ✨ Extractor Recovery: Datum nalezeno v textu -> {normalized}")
+
+        # 2. Hledání ČÁSTKY (např. "Částka k nalezení: 177,00 Kč")
+        if result.get('total_amount') is None:
+            # Odstraněna nebezpečná nested kvantifikace (?:...)+
+            amount_match = re.search(r'(?i)částka[^:]*[:\s]+([\d\s,.]+)\s*(?:Kč|CZK|EUR|USD|€)', raw_output)
+            if amount_match:
+                try:
+                    num_str = amount_match.group(1).replace(' ', '').replace(',', '.')
+                    # Ošetření teček jako tisíců
+                    if num_str.count('.') > 1:
+                        parts = num_str.rsplit('.', 1)
+                        num_str = parts[0].replace('.', '') + '.' + parts[1]
+                    
+                    result['total_amount'] = float(num_str)
+                    logger.debug(f"  ✨ Extractor Recovery: Částka nalezena v textu -> {result['total_amount']}")
+                except ValueError:
+                    pass
+
+        # 3. Hledání VARIABILNÍHO SYMBOLU (častý problém)
+        if not result.get('variable_symbol'):
+            # Odstraněna nebezpečná nested kvantifikace (?:...)+
+            vs_match = re.search(r'(?i)(?:vs|variabilní symbol|symbol)[^:]*[:\s]+(\d{1,10})', raw_output)
+            if vs_match:
+                result['variable_symbol'] = vs_match.group(1)
+                logger.debug(f"  ✨ Extractor Recovery: VS nalezen v textu -> {result['variable_symbol']}")
+
+        return result
 
     def _empty_result(self) -> dict:
-        """Return empty extraction result."""
         return {
-            'invoice_number': None,
-            'vendor_name': None,
-            'vendor_ico': None,
-            'vendor_dic': None,
-            'customer_name': None,
-            'customer_ico': None,
-            'issue_date': None,
-            'due_date': None,
-            'total_amount': None,
-            'total_amount_raw': None,
-            'currency': None,
-            'vat_amount': None,
-            'base_amount': None,
-            'bank_account': None,
-            'variable_symbol': None,
-            'completeness_score': 0.0,
-            'validation_errors': ['Žádná data k extrakci']
+            'invoice_number': None, 'vendor_name': None, 'vendor_ico': None, 'vendor_dic': None,
+            'customer_name': None, 'customer_ico': None, 'issue_date': None, 'due_date': None,
+            'total_amount': None, 'total_amount_raw': None, 'currency': None,
+            'vat_amount': None, 'base_amount': None, 'bank_account': None, 'variable_symbol': None,
+            'vendor_address': None, 'customer_address': None,
+            'completeness_score': 0.0, 'validation_errors': ['Žádná data k extrakci']
         }
     
-    def _fallback_extraction(self, text: str) -> dict:
-        """Fallback rule-based extraction when AI fails."""
-        text_lower = text.lower()
+    def _fallback_extraction(self, markdown_input: str) -> dict:
+        """Záchranná extrakce z Markdown vstupu."""
+        markdown_lower = markdown_input.lower()
         result = self._empty_result()
-        
-        # Extract date
-        date_match = re.search(self.DATE_PATTERN, text)
-        if date_match:
-            result['issue_date'] = f"{date_match.group(3)}-{date_match.group(2).zfill(2)}-{date_match.group(1).zfill(2)}"
-        
-        # Extract amount
-        amount_match = re.search(self.AMOUNT_PATTERN, text_lower)
+
+        date_match = re.search(self.date_pattern, markdown_input)
+        if date_match: result['issue_date'] = f"{date_match.group(3)}-{date_match.group(2).zfill(2)}-{date_match.group(1).zfill(2)}"
+
+        amount_match = re.search(self.amount_pattern, markdown_lower)
         if amount_match:
-            amount_str = amount_match.group(1).replace(' ', '').replace('.', '').replace(',', '.')
-            try:
-                result['total_amount'] = float(amount_str)
-            except ValueError:
-                pass
-        
-        # Detect currency - ONLY if explicitly found in text, NO fallback!
-        if '€' in text or 'EUR' in text_lower or 'eur' in text_lower:
-            result['currency'] = 'EUR'
-        elif '$' in text or 'USD' in text_lower or 'usd' in text_lower:
-            result['currency'] = 'USD'
-        elif 'Kč' in text or 'CZK' in text_lower or 'czk' in text_lower or 'KC' in text:
-            result['currency'] = 'CZK'
-        # NO FALLBACK - currency must be explicitly present in text!
-        
-        # Extract first company name - VYLEPŠENÍ PRO EN (podpora Ltd., Inc., LLC, GmbH atd.)
-        company_match = re.search(r'\b([A-ZČŠŽŘĎŤŇĚÁÉÍÓÚÝ][a-zčšžřďťňěáéíóúýA-Za-z\s]+(?:s\.r\.o\.|a\.s\.|spol\.\s+r\.o\.|Ltd\.?|Inc\.?|LLC|GmbH))', text)
-        if company_match:
-            result['vendor_name'] = company_match.group(1).strip()
-        
+            try: result['total_amount'] = float(amount_match.group(1).replace(' ', '').replace('.', '').replace(',', '.'))
+            except ValueError: pass
+
+        if '€' in markdown_input or 'EUR' in markdown_lower or 'eur' in markdown_lower: result['currency'] = 'EUR'
+        elif '$' in markdown_input or 'USD' in markdown_lower or 'usd' in markdown_lower: result['currency'] = 'USD'
+        elif 'Kč' in markdown_input or 'CZK' in markdown_lower or 'czk' in markdown_lower or 'KC' in markdown_input: result['currency'] = 'CZK'
+
+        company_match = re.search(r'\b([A-ZČŠŽŘĎŤŇĚÁÉÍÓÚÝ][a-zčšžřďťňěáéíóúýA-Za-z\s]+(?:s\.r\.o\.|a\.s\.|spol\.\s+r\.o\.|Ltd\.?|Inc\.?|LLC|GmbH))', markdown_input)
+        if company_match: result['vendor_name'] = company_match.group(1).strip()
+
         result['completeness_score'] = self._calculate_completeness(result)
-        
         return result

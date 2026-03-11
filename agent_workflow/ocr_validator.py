@@ -1,17 +1,15 @@
 """
 OCR Text Validator
-Validuje text po OCR z Tesseractu:
+Validuje text po OCR z Tesseractu/RapidOCR:
 - Kontroluje pravopis (čeština/angličtina)
 - Detekuje halucinovaná slova (nesmyslné znaky)
 - Opravuje běžné OCR chyby
-- Vrací pouze smysluplná slova pro další agenty
-
-Inspired by: document_langgraph_workflow.py validator_node
+- Vrací pouze smysluplná slova a zachovává souřadnice bloků pro prostorové formátování
 """
 
 import re
 import logging
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 from pathlib import Path
 
 try:
@@ -26,19 +24,18 @@ logger = logging.getLogger(__name__)
 
 class OCRTextValidator:
     """
-    Validuje a čistí text po OCR.
+    Validuje a čistí text po OCR s podporou pro prostorové souřadnice (x, y, bbox).
     
     Workflow:
-    1. Rozdělení textu na slova
+    1. Rozdělení textu/bloků na slova
     2. Detekce jazyka (čeština/angličtina)
     3. Kontrola pravopisu
     4. Oprava běžných OCR chyb
     5. Filtrace halucinovaných slov
-    6. Rekonstrukce smysluplného textu
+    6. Rekonstrukce smysluplného textu a zachování validních bloků se souřadnicemi
     """
     
     # Běžné OCR chyby (Tesseract confusion matrix)
-    # POZOR: Pořadí aplikací oprav je důležité! Nejdříve dlouhé patterny, pak krátké.
     OCR_CONFUSIONS = {
         # Číslo-písmeno-číslo opravy (pro adresy typu "2I6" → "216")
         '2I6': '216', '2I5': '215', '2I4': '214', '2I3': '213', '2I2': '212', '2I1': '211',
@@ -49,7 +46,7 @@ class OCRTextValidator:
         'l6': '16', 'l5': '15', 'l4': '14', 'l3': '13', 'l2': '12', 'l1': '11',
         
         # Speciální znaky
-        'č': 'č', 'ć': 'č', 'ċ': 'č',  # Normalize caron
+        'č': 'č', 'ć': 'č', 'ċ': 'č',
         'š': 'š', 'ś': 'š',
         'ž': 'ž', 'ź': 'ž',
         'ě': 'ě', 'e': 'e',
@@ -67,7 +64,6 @@ class OCRTextValidator:
     
     # Whitelist pro faktury - tato slova vždy považovat za platná
     INVOICE_WHITELIST = {
-        # Čeština
         'faktura', 'faktúry', 'daňový', 'doklad', 'dodavatel', 'odběratel',
         'ičo', 'dič', 'splatnosti', 'vystavení', 'úhradě', 'celkem', 'bez',
         'dpH', 'DPH', 'sazba', 'množství', 'jednotka', 'cena', 'celkem',
@@ -77,45 +73,39 @@ class OCRTextValidator:
         'adresou', 'sídlem', 'zastoupený', 'společnost', 'firma',
         's.r.o.', 'a.s.', 'v.o.s.', 'spol.', 'r.o.', 'z.s.',
         'Kč', 'EUR', 'USD', 'CZK', 'Sk', 'zl',
-        # Měrné jednotky (často vyřazováno kvůli malému počtu znaků)
         'ks', 'kg', 'km', 'hod', 'm2', 'm3', 'cm', 'mm', 'l', 'ml', 'g', 'mg',
-        # Angličtina
         'invoice', 'tax', 'document', 'supplier', 'customer', 'vendor',
         'vat', 'amount', 'total', 'quantity', 'unit', 'price',
-        'payment', 'bank', 'account', 'due', 'date', 'issue', 'number', 
-        'order', 'contract', 'company', 'address', 'registered', 'office', 
+        'payment', 'bank', 'account', 'due', 'date', 'issue', 'number',
+        'order', 'contract', 'company', 'address', 'registered', 'office',
         'represented', 'Ltd', 'Inc', 'GmbH', 'AG', 'SA', 'NV', 'GBP',
         'pcs', 'hours', 'hr', 'hrs',
-        # Česká města a regiony (častá v adresách)
+        # Města a kraje - pouze pro validaci OCR (nejsou to fakturační klíčová slova!)
         'Ústecký', 'ústecký', 'Ústí', 'ústí', 'Praha', 'pražský',
         'Brno', 'brněnský', 'Ostrava', 'Plzeň', 'Liberec', 'Zlín',
-        'Sobědruhy', 'sobědruhy', 'Polní', 'polní', 'Hlavní', 'hlavní',
-        'Dlouhá', 'dlouhá', 'Malá', 'malá', 'Velká', 'velká',
-        # Častá příjmení
+        # Příjmení - pouze pro validaci OCR (nejsou to fakturační klíčová slova!)
         'Novák', 'Svoboda', 'Dvořák', 'Černý', 'Procházka',
         'Krejčí', 'Němec', 'Navrátil', 'Havlíček', 'Horák',
         'Pokorný', 'Jelínek', 'Kovář', 'Adam', 'Tichý',
         'Beneš', 'Čech', 'Moravec', 'Liška', 'Růžička',
     }
     
-    # OPRAVA: Zrušeny restriktivní patterny pro délku slov a souhlásky
     HALLUCINATION_PATTERNS = [
-        r'(.)\1{5,}',  # Extrémně opakující se znaky (6+), např. 'xxxxxx'
-        r'^[aeiouyáéíóúýěů]{6,}$',  # Pouze samohlásky (6+) - např. 'aaaaaa'
-        r'[\u0400-\u04FF]', # Nalezena Azbuka (Cyrillic)
-        # OPRAVA: Zmírněno - neznámé znaky ano, ale ponechány běžné formátovací znaky pro čísla a cizí měny
+        r'(.)\1{5,}',  
+        r'^[aeiouyáéíóúýěů]{6,}$',  
+        r'[\u0400-\u04FF]', 
         r'[^a-zA-Z0-9\s.,;:!?\-_\/\\()""\'\áéíóúýčďěňřšťžůÁÉÍÓÚÝČĎĚŇŘŠŤŽŮ€$£@&%]', 
     ]
     
     VALID_WORD_PATTERNS = [
-        r'^\d{1,2}\.\d{1,2}\.\d{4}$',  # Datum DD.MM.YYYY
-        r'^\d{4}-\d{2}-\d{2}$',  # Datum YYYY-MM-DD
-        r'^CZ\d{2,3}\d{4,6}[- ]?\d{2,4}[- ]?\d{2,4}$',  # IBAN/CZ účet
-        r'^\d{6,10}$',  # IČO
-        r'^[A-Z]{2}\d{8,12}$',  # DIČ
-        r'^[A-Z0-9-]{3,15}$',  # Faktura číslo / Variabilní symbol / Kódy
-        r'^\d+([.,]\d{1,2})?$',  # Čísla a částky s desetinnými místy
-        r'^[A-Z]\.$',  # Iniciály (J., M., atd.)
+        r'^\d{1,2}\.\d{1,2}\.\d{4}$',  
+        r'^\d{4}-\d{2}-\d{2}$',  
+        r'^CZ\d{2,3}\d{4,6}[- ]?\d{2,4}[- ]?\d{2,4}$',  
+        r'^\d{6,10}$',  
+        r'^[A-Z]{2}\d{8,12}$',  
+        r'^[A-Z0-9-]{3,15}$',  
+        r'^\d+([.,]\d{1,2})?$',  
+        r'^[A-Z]\.$',  
     ]
     
     SHORT_WORDS_CS = {
@@ -149,7 +139,7 @@ class OCRTextValidator:
                 self.spell_cs = SpellChecker(language="cs", local_dictionary=Path(__file__).parent / "cs.json")
             except (ValueError, FileNotFoundError) as e:
                 logger.debug(f"Czech spellchecker not available: {e}")
-                self.spell_cs = SpellChecker()  # Fallback to English
+                self.spell_cs = SpellChecker()
             
             try:
                 self.spell_en = SpellChecker(language="en")
@@ -158,57 +148,78 @@ class OCRTextValidator:
         else:
             logger.warning("SpellChecker not available - using pattern-based validation only")
     
-    def validate(self, text: str) -> Dict:
-        """Hlavní validace OCR textu."""
-        if not text or len(text.strip()) < 10:
-            return {
-                "valid_text": text or "",
-                "original_words": 0,
-                "valid_words": 0,
-                "corrected_words": 0,
-                "hallucinated_words": 0,
-                "corrections": [],
-                "hallucinations": [],
-                "confidence": 0.0,
-                "detected_language": "unknown"
-            }
+    def validate(self, data: Union[str, List[Dict]]) -> Dict:
+        """Hlavní validace OCR textu nebo strukturovaných OCR bloků."""
         
-        # Tokenizace
-        words = self._tokenize(text)
-        
+        # 1. Normalizace vstupu na formát bloků
+        if isinstance(data, str):
+            if not data or len(data.strip()) < 10:
+                return self._empty_result(data)
+            blocks = [{"text": data}]
+        elif isinstance(data, list):
+            blocks = data
+            if not blocks:
+                return self._empty_result("")
+        else:
+            raise ValueError("Input data must be a string or a list of dictionaries.")
+
+        # 2. Extrahování všech slov pro detekci jazyka
+        all_words = []
+        for block in blocks:
+            text = block.get('text', '')
+            if isinstance(text, str):
+                all_words.extend(self._tokenize(text))
+
         # Detekce jazyka
-        detected_lang = self._detect_language(words)
+        detected_lang = self._detect_language(all_words)
         
-        # Validace každého slova
+        # 3. Validace po blocích
         corrections = []
         hallucinations = []
-        valid_words = []
+        valid_words_flat = []
+        valid_blocks = [] # Ukládání opravených bloků i se souřadnicemi
         
-        for word in words:
-            result = self._validate_word(word, detected_lang)
+        for block in blocks:
+            original_text = block.get("text", "")
+            if not isinstance(original_text, str) or not original_text.strip():
+                continue
+
+            words_in_block = self._tokenize(original_text)
+            valid_block_words = []
             
-            if result["status"] == "valid":
-                valid_words.append(word)
-            elif result["status"] == "corrected":
-                valid_words.append(result["corrected"])
-                corrections.append({
-                    "original": word,
-                    "corrected": result["corrected"],
-                    "reason": result["reason"]
-                })
-            elif result["status"] == "hallucination":
-                hallucinations.append(word)
-                corrections.append({
-                    "original": word,
-                    "corrected": None,
-                    "reason": result["reason"]
-                })
+            for word in words_in_block:
+                result = self._validate_word(word, detected_lang)
+                
+                if result["status"] == "valid":
+                    valid_block_words.append(word)
+                    valid_words_flat.append(word)
+                elif result["status"] == "corrected":
+                    valid_block_words.append(result["corrected"])
+                    valid_words_flat.append(result["corrected"])
+                    corrections.append({
+                        "original": word,
+                        "corrected": result["corrected"],
+                        "reason": result["reason"]
+                    })
+                elif result["status"] == "hallucination":
+                    hallucinations.append(word)
+                    corrections.append({
+                        "original": word,
+                        "corrected": None,
+                        "reason": result["reason"]
+                    })
+            
+            # Pokud v bloku zůstalo nějaké smysluplné slovo, zrekonstruujeme text a uložíme blok
+            if valid_block_words:
+                new_block = block.copy() # Zachová 'bbox', 'x', 'y' atd.
+                new_block["text"] = " ".join(valid_block_words)
+                valid_blocks.append(new_block)
         
-        # Rekonstrukce textu
-        valid_text = " ".join(valid_words)
+        # Rekonstrukce plochého textu
+        valid_text = " ".join(valid_words_flat)
         
-        total_words = len(words)
-        valid_count = len(valid_words)
+        total_words = len(all_words)
+        valid_count = len(valid_words_flat)
         hallucinated_count = len(hallucinations)
         
         confidence = (valid_count / total_words) if total_words > 0 else 0.0
@@ -221,6 +232,7 @@ class OCRTextValidator:
         
         return {
             "valid_text": valid_text,
+            "valid_blocks": valid_blocks, # Předání bloků pro další zpracování
             "original_words": total_words,
             "valid_words": valid_count,
             "corrected_words": len(corrections),
@@ -230,17 +242,24 @@ class OCRTextValidator:
             "confidence": round(confidence, 3),
             "detected_language": detected_lang
         }
+
+    def _empty_result(self, raw_text: str) -> Dict:
+        """Pomocná metoda pro vrácení prázdného výsledku."""
+        return {
+            "valid_text": raw_text if isinstance(raw_text, str) else "",
+            "valid_blocks": [],
+            "original_words": 0,
+            "valid_words": 0,
+            "corrected_words": 0,
+            "hallucinated_words": 0,
+            "corrections": [],
+            "hallucinations": [],
+            "confidence": 0.0,
+            "detected_language": "unknown"
+        }
     
     def _tokenize(self, text: str) -> List[str]:
-        """
-        OPRAVA: Šetrnější rozdělení textu na slova.
-        Původní logika rozbila částku '1 500,00' na '1', '500', '00' a pak je vyhodila.
-        Tento nový přístup zachovává integritu čísel a emailů.
-        """
-        # Zachováme nové řádky a tabulátory převedením na mezeru
         text = text.replace('\n', ' ').replace('\t', ' ')
-        
-        # Rozdělíme čistě jen podle mezer (nepoužijeme agresivní regex s interpunkcí)
         raw_words = text.split()
         
         cleaned_words = []
@@ -249,12 +268,10 @@ class OCRTextValidator:
             if not word:
                 continue
             
-            # Pokud je slovo samotná měna nebo symbol (který by se jinak smazal)
             if word in ('€', '$', '£', '%'):
                 cleaned_words.append(word)
                 continue
                 
-            # Jemné očištění od okrajové interpunkce, ale ponecháme ji uvnitř slova (pro emaily, weby a desetinná čísla)
             cleaned = word.strip('.,;:!?()[]{}"\'')
             if cleaned:
                 cleaned_words.append(cleaned)
@@ -262,30 +279,23 @@ class OCRTextValidator:
         return cleaned_words
     
     def _detect_language(self, words: List[str]) -> str:
-        """Detekce jazyka na základě slov."""
         cs_count = 0
         en_count = 0
-        
         cs_chars = {'á', 'é', 'í', 'ó', 'ú', 'ý', 'č', 'ď', 'ě', 'ň', 'ř', 'š', 'ť', 'ž', 'ů'}
         
         for word in words[:100]:
             word_lower = word.lower()
-            
             if any(c in word_lower for c in cs_chars):
                 cs_count += 2
                 continue
-            
             if word_lower in {'faktura', 'daňový', 'doklad', 'dodavatel', 'odběratel', 'částka', 'splatnosti'}:
                 cs_count += 3
                 continue
-            
             if word_lower in {'invoice', 'supplier', 'customer', 'amount', 'vat', 'tax'}:
                 en_count += 3
                 continue
-            
             if word_lower in self.SHORT_WORDS_CS:
                 cs_count += 1
-            
             if word_lower in self.SHORT_WORDS_EN:
                 en_count += 1
         
@@ -297,10 +307,8 @@ class OCRTextValidator:
             return "mixed"
     
     def _validate_word(self, word: str, language: str) -> Dict:
-        """Validace jednotlivého slova."""
         word_lower = word.lower()
         
-        # OPRAVA: Všechna samotná čísla (i jednociferná) a částky jsou vždy validní!
         if any(char.isdigit() for char in word):
              return {"status": "valid", "reason": "contains_number"}
 
@@ -335,7 +343,6 @@ class OCRTextValidator:
                 if self.spell_en.unknown([word_lower]) and not self.spell_en.unknown([corrected]):
                     return {"status": "corrected", "corrected": corrected, "reason": "spellcheck_en"}
         
-        # Aplikace OCR oprav
         corrected = self._apply_ocr_corrections(word)
         if corrected != word:
             return {"status": "corrected", "corrected": corrected, "reason": "ocr_confusion"}
@@ -343,7 +350,6 @@ class OCRTextValidator:
         return {"status": "valid", "reason": "unknown_but_allowed"}
     
     def _apply_ocr_corrections(self, word: str) -> str:
-        """Aplikace běžných OCR oprav."""
         corrected = word
 
         long_patterns = [
@@ -360,8 +366,6 @@ class OCRTextValidator:
             if wrong in corrected:
                 corrected = corrected.replace(wrong, right)
 
-        # Nezahrnujeme substituci jednotlivých znaků (číslo za písmeno), pokud už slovo obsahuje čísla, 
-        # zabráníme tím poškození validních dat.
         if not any(c.isdigit() for c in word):
             char_subs = {
                 '´': "'", '`': "'",
@@ -380,7 +384,6 @@ class OCRTextValidator:
         return corrected
     
     def get_summary(self, validation_result: Dict) -> str:
-        """Vytvoří čitelný souhrn validace."""
         lines = [
             f"📝 OCR Text Validation Summary",
             f"  Original words: {validation_result['original_words']}",
@@ -405,29 +408,36 @@ class OCRTextValidator:
 # ─────────────────────────────────────────────
 # Integration helper
 # ─────────────────────────────────────────────
-def validate_ocr_text(text: str, language: str = "auto") -> Tuple[str, Dict]:
-    """Quick helper function for OCR text validation."""
+def validate_ocr_text(data: Union[str, List[Dict]], language: str = "auto") -> Tuple[str, Dict]:
+    """
+    Rychlá pomocná funkce pro validaci OCR.
+    Vrací dvojici: (očištěný text jako string, výsledek analýzy jako dict obsahující i valid_blocks)
+    """
     validator = OCRTextValidator(language=language)
-    result = validator.validate(text)
+    result = validator.validate(data)
     
     logger.debug(f"OCR Validation: {result['valid_words']}/{result['original_words']} words valid ({result['confidence']:.0%})")
     
     if result['hallucinations']:
         logger.warning(f"  Detected {result['hallucinated_words']} hallucinated words: {result['hallucinations'][:5]}")
     
+    # Vracíme pouze dvě hodnoty očekávané enginem. Bloky s pozicemi jsou zabalené ve slovníku result.
     return result["valid_text"], result
 
 
 if __name__ == "__main__":
-    test_text = """
-    FAKTURA č. 2024001
-    Dodavatel: ABC s.r.o., IČO: 12345678
-    Odběratel: XYZ a.s., IČO: 87654321
-    Datum vystavení: 15.01.2024
-    Datum splatnosti: 15.02.2024
-    Celkem k úhradě: 1 500 Kč
-    """
+    # Testovací data (simulující to, co pošle tvůj OCRExtractor)
+    test_blocks = [
+        {"text": "FAKTURA", "bbox": {"x0": 10, "y0": 10, "x1": 50, "y1": 20}},
+        {"text": "č. 2024001", "bbox": {"x0": 100, "y0": 10, "x1": 150, "y1": 20}},
+        {"text": "Dodavatel:", "bbox": {"x0": 10, "y0": 30, "x1": 60, "y1": 40}},
+        {"text": "ABC s.r.o., IČO: 12345678", "bbox": {"x0": 100, "y0": 30, "x1": 250, "y1": 40}},
+        {"text": "XyZasdfg", "bbox": {"x0": 10, "y0": 50, "x1": 40, "y1": 60}}, # Halucinace
+    ]
     
     validator = OCRTextValidator()
-    result = validator.validate(test_text)
+    result = validator.validate(test_blocks)
     print(validator.get_summary(result))
+    print("\nValid blocks:")
+    for b in result["valid_blocks"]:
+        print(f" - {b}")

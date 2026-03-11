@@ -2,45 +2,37 @@
 Consensus Engine
 Combines results from multiple agents using weighted voting
 
-v6.5 (Aktualizováno):
+v7.3 (2026-02-28):
+- ODSTRANĚNA HLOUPÁ TEXTOVÁ ANALÝZA REASONINGU (Zabraňuje sabotáži Markdown výstupu)
+- Plná podpora pro Markdown boolean výstupy z ClassifierAgenta
+- Oprava AttributeError u NON_INVOICE_ANOMALY_TYPES
 - Sjednocení a rozšíření NON_INVOICE typů
-- Přidána robustní podpora pro anglické životopisy a nesouvisející texty
-- Čištění duplicitního kódu (konstanty přesunuty do třídy)
+- Čištění duplicitního kódu
+
+Uses external configuration from config/rules.yaml for keywords and patterns.
+Edit the YAML file to tune accuracy without modifying this code.
 """
 
 import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
+# Import configuration loader
+try:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from config_loader import get_config
+    CONFIG = get_config()
+except Exception as e:
+    logging.warning(f"Config loader not available: {e}. Using built-in defaults.")
+    CONFIG = None
+
 logger = logging.getLogger(__name__)
 
 # Konfigurační konstanty
-MIN_REALISTIC_AMOUNT = 10  
-CHECK_AMOUNT_REALISTIC = False  
-
-# Invoice keywords pro kontrolu v anomaly detectoru (česká + anglická)
-INVOICE_KEYWORDS_CS = [
-    'faktura', 'faktúry', 'daňový doklad', 'zálohová faktura', 'konečná faktura', 'proforma',
-    'dodavatel', 'odběratel', 'objednatel', 'zhotovitel', 'poskytovatel', 'příjemce',
-    'ičo', 'dič', 'společnost', 'firma', 's.r.o.', 'a.s.', 'v.o.s.',
-    'datum vystavení', 'datum splatnosti', 'vystaveno', 'splatnost', 'du', 'dv',
-    'celkem', 'k úhradě', 'částka', 'cena', 'součet', 'úhrada', 'platba',
-    'bez dph', 'dpH', 'sazba', 'základ daně',
-    'variabilní symbol', 'konstantní symbol', 'specifický symbol', 'banka', 'účet', 'iban', 'bic', 'swift',
-    'kč', 'czk', 'eur', '€', 'usd', '$', 'gbp', '£',
-]
-
-INVOICE_KEYWORDS_EN = [
-    'invoice', 'tax document', 'proforma', 'bill', 'receipt',
-    'supplier', 'vendor', 'customer', 'buyer', 'seller', 'contractor',
-    'company', 'limited', 'inc.', 'corp.', 'gmbh',
-    'vat', 'tax id', 'registration no',
-    'issue date', 'due date', 'date of issue', 'dated',
-    'total', 'amount', 'price', 'sum', 'payment', 'balance',
-    'excl. vat', 'incl. vat', 'vat rate', 'tax base', 'subtotal',
-    'payment reference', 'bank account', 'account no', 'iban', 'bic', 'swift',
-    'eur', 'usd', 'gbp', 'czk', 'pln', 'huf', '€', '$', '£',
-]
+MIN_REALISTIC_AMOUNT = 10
+CHECK_AMOUNT_REALISTIC = False
 
 
 @dataclass
@@ -56,19 +48,7 @@ class ConsensusEngine:
     """
     Combines results from multiple agents using weighted voting.
     """
-    
-    # VYLEPŠENÍ: Centrální definice anomálií pro celý engine (CZ + EN)
-    NON_INVOICE_ANOMALY_TYPES = [
-        # Životopisy a osobní dokumenty
-        'cv_resume', 'zivotopis', 'životopis', 'cv', 'resume', 'curriculum',
-        'education', 'vzdělání', 'skills', 'dovednosti', 'experience', 'praxe',
-        # Certifikáty a smlouvy
-        'certifikát', 'certifikat', 'osvědčení', 'certificate',
-        'smlouva', 'contract', 'dohoda', 'agreement', 'plná moc', 'plnomocenství',
-        # Obchodní texty
-        'nabídka', 'offer', 'objednávka', 'order', 'licence', 'license'
-    ]
-    
+
     def __init__(
         self,
         threshold_accept: float = 0.7,
@@ -78,14 +58,60 @@ class ConsensusEngine:
         self.threshold_accept = threshold_accept
         self.threshold_review = threshold_review
         self.anomaly_veto_threshold = anomaly_veto_threshold
-        
+
         # Agent weights
         self.weights = {
             'classifier': 0.4,
             'extractor': 0.3,
             'anomaly': 0.3
         }
+        
+        # Load keywords and patterns from external config
+        if CONFIG:
+            self.invoice_keywords_cs = CONFIG.get_invoice_keywords_cs()
+            self.invoice_keywords_en = CONFIG.get_invoice_keywords_en()
+            self.non_invoice_patterns = CONFIG.get_non_invoice_patterns()
+        else:
+            # Fallback to built-in defaults
+            self.invoice_keywords_cs = [
+                'faktura', 'faktúry', 'daňový doklad', 'zálohová faktura', 'konečná faktura', 'proforma',
+                'dodavatel', 'odběratel', 'objednatel', 'zhotovitel', 'poskytovatel', 'příjemce',
+                'ičo', 'dič', 'společnost', 'firma', 's.r.o.', 'a.s.', 'v.o.s.',
+                'datum vystavení', 'datum splatnosti', 'vystaveno', 'splatnost', 'du', 'dv',
+                'celkem', 'k úhradě', 'částka', 'cena', 'součet', 'úhrada', 'platba',
+                'bez dph', 'dpH', 'sazba', 'základ daně',
+                'variabilní symbol', 'konstantní symbol', 'specifický symbol', 'banka', 'účet', 'iban', 'bic', 'swift',
+                'kč', 'czk', 'eur', '€', 'usd', '$', 'gbp', '£',
+            ]
+            self.invoice_keywords_en = [
+                'invoice', 'tax document', 'proforma', 'bill', 'receipt',
+                'supplier', 'vendor', 'customer', 'buyer', 'seller', 'contractor',
+                'company', 'limited', 'inc.', 'corp.', 'gmbh',
+                'vat', 'tax id', 'registration no',
+                'issue date', 'due date', 'date of issue', 'dated',
+                'total', 'amount', 'price', 'sum', 'payment', 'balance',
+                'excl. vat', 'incl. vat', 'vat rate', 'tax base', 'subtotal',
+                'payment reference', 'bank account', 'account no', 'iban', 'bic', 'swift',
+                'eur', 'usd', 'gbp', 'czk', 'pln', 'huf', '€', '$', '£',
+            ]
+            self.non_invoice_patterns = {}
+        
+        # Combined invoice keywords for easy access
+        self.all_invoice_keywords = self.invoice_keywords_cs + self.invoice_keywords_en
+        
+        # Non-invoice patterns as flat list for quick lookup
+        self.non_invoice_anomaly_types = []
+        for category, keywords in self.non_invoice_patterns.items():
+            if isinstance(keywords, list):
+                self.non_invoice_anomaly_types.extend(keywords)
+            elif isinstance(keywords, dict):
+                self.non_invoice_anomaly_types.extend(keywords.get('keywords', []))
     
+    @property
+    def NON_INVOICE_ANOMALY_TYPES(self) -> list:
+        """Property pro zajištění zpětné kompatibility velkých/malých písmen."""
+        return self.non_invoice_anomaly_types
+
     def calculate_consensus(
         self,
         classifier_result: dict,
@@ -101,113 +127,149 @@ class ConsensusEngine:
         if veto_result:
             return veto_result
 
-        reasoning = classifier_result.get('reasoning', '').lower()
-        
-        # VYLEPŠENÍ: Rozšířeno o naše nová slova ze životopisů
-        NON_INVOICE_PATTERNS = [
-            # CZ
-            ('jízdenka', 'ticket'), ('lístek', 'ticket'), ('vstupenka', 'ticket'),
-            ('životopis', 'cv/resume'), ('praxe', 'cv/resume'), ('dovednosti', 'cv/resume'), ('vzdělání', 'cv/resume'),
-            ('certifikát', 'certificate'), ('osvědčení', 'certificate'),
-            ('smlouva', 'contract'), ('dohoda', 'agreement'),
-            ('plná moc', 'power of attorney'), ('plnomocenství', 'power of attorney'),
-            ('nabídka', 'offer'), ('poptávka', 'inquiry'), ('ceník', 'price list'),
-            ('katalog', 'catalog'), ('reklama', 'advertisement'), ('leták', 'flyer'),
-            ('pozvánka', 'invitation'), ('upomínka', 'reminder'), ('výzva', 'notice'),
-            ('rozhodnutí', 'decision'), ('usnesení', 'resolution'), ('zápis', 'minutes'),
-            ('prezentace', 'presentation'), ('návod', 'manual'), ('manuál', 'manual'),
-            # EN
-            ('ticket', 'ticket'),
-            ('cv', 'cv/resume'), ('resume', 'cv/resume'), ('curriculum', 'cv/resume'),
-            ('education', 'cv/resume'), ('skills', 'cv/resume'), ('experience', 'cv/resume'),
-            ('certificate', 'certificate'), ('contract', 'contract'), ('agreement', 'agreement'),
-            ('offer', 'offer'), ('quote', 'quote'), ('quotation', 'quote'),
-            ('price list', 'price list'), ('catalog', 'catalog'), ('flyer', 'flyer'),
-            ('invitation', 'invitation'), ('reminder', 'reminder'), ('notice', 'notice'),
-            ('minutes', 'minutes'), ('presentation', 'presentation'), ('manual', 'manual'), ('guide', 'manual'),
-        ]
-        
-        reasoning_classifier_says_not_invoice = False
-        detected_document_type = None
-        
-        NOT_INVOICE_PATTERNS = [
-            'není faktura', 'není to faktura', 'nejedná se o fakturu',
-            'není daňový doklad', 'nejedná o fakturu',
-            'dokument není', 'toto není faktura',
-            'not an invoice', 'is not an invoice', 'not a tax document',
-            'this is not an invoice', 'document is not', 'does not appear to be an invoice'
-        ]
-        
-        for pattern in NOT_INVOICE_PATTERNS:
-            if pattern in reasoning:
-                reasoning_classifier_says_not_invoice = True
-                for doc_pattern, doc_name in NON_INVOICE_PATTERNS:
-                    if doc_pattern in reasoning:
-                        detected_document_type = doc_name
-                        break
-                break
-        
-        if not reasoning_classifier_says_not_invoice:
-            for doc_pattern, doc_name in NON_INVOICE_PATTERNS:
-                if (f'je to {doc_pattern}' in reasoning or 
-                    f'jedná se o {doc_pattern}' in reasoning or 
-                    f'jde o {doc_pattern}' in reasoning or
-                    f'this is a {doc_pattern}' in reasoning or
-                    f'this is an {doc_pattern}' in reasoning):
-                    reasoning_classifier_says_not_invoice = True
-                    detected_document_type = doc_name
-                    break
-        
-        if reasoning_classifier_says_not_invoice:
-            logger.debug(f"  ✗ Classifier REASONING explicitně říká NENÍ faktura: '{reasoning[:100]}...'")
-            logger.debug(f"  Detekovaný typ dokumentu: {detected_document_type}")
-            return {
-                'is_invoice': False,
-                'confidence': max(classifier_conf, 0.9), 
-                'decision_type': 'auto_reject',
-                'weighted_score': 0.1,
-                'agent_scores': {
-                    'classifier': 1 - classifier_conf, 
-                    'extractor': 0.0, 
-                    'anomaly': 1 - anomaly_result.get('confidence', 0)
-                },
-                'agent_agreement': {
-                    'full_agreement': False,
-                    'majority_agreement': True,
-                    'agreement_count': 2, 
-                    'total_agents': 3
-                },
-                'reasoning': f"Classifier v reasoningu explicitně uvedl že dokument NENÍ faktura: '{reasoning[:150]}...' → NENÍ faktura (typ: {detected_document_type or 'ne-faktura'})",
-                'extracted_data': {},
-                'classifier_reasoning_detected': True,
-                'detected_document_type': detected_document_type
-            }
-        
+        # === ODSTRANĚNA HLOUPÁ TEXTOVÁ ANALÝZA REASONINGU ===
+        # Dříve se zde hledala slova jako "není faktura" v reasoningu,
+        # což způsobovalo false-positives zamítnutí. Nyní věříme strukturovaným datům.
+
+        # === PŘÍPRAVA DAT PRO KONTROLY ===
+        field_check = {
+            'číslo faktury': bool(extractor_result.get('invoice_number')),
+            'dodavatel': bool(extractor_result.get('vendor_name')),
+            'odběratel': bool(extractor_result.get('customer_name')),
+            'datum vystavení': bool(extractor_result.get('issue_date') and extractor_result.get('issue_date') != '0000-00-00'),
+            'datum splatnosti': bool(extractor_result.get('due_date') and extractor_result.get('due_date') != '0000-00-00'),
+            'částka': bool(extractor_result.get('total_amount') is not None or bool(extractor_result.get('total_amount_raw'))),
+            'účet/IBAN': bool(extractor_result.get('bank_account')),
+        }
+        extractor_fields_found = sum(field_check.values())
+        missing_fields = [k for k, v in field_check.items() if not v]
+
+        extractor_completeness = extractor_result.get('completeness_score', 0)
+
+        # === KONTROLA ŽIVOTOPISU ===
+        # Kontrolujeme vždy když je text k dispozici - i když classifier zamítl!
+        if raw_text:
+            cv_check = self._check_cv_resume(raw_text)
+            if cv_check['is_cv']:
+                logger.warning(f"  ⚠️ CV DETEKOVÁN: Text obsahuje znaky životopisu ({cv_check['indicators']})")
+                return {
+                    'is_invoice': False,
+                    'confidence': max(cv_check['confidence'], 0.95),
+                    'decision_type': 'auto_reject',
+                    'weighted_score': 0.05,
+                    'agent_scores': {
+                        'classifier': classifier_conf if classifier_is_invoice else 0.0,
+                        'extractor': 0.0,
+                        'anomaly': 1.0
+                    },
+                    'agent_agreement': {
+                        'full_agreement': True,
+                        'majority_agreement': True,
+                        'agreement_count': 3,
+                        'total_agents': 3
+                    },
+                    'reasoning': f"Dokument je životopis/CV - detekovány znaky: {', '.join(cv_check['indicators'])}",
+                    'cv_detected': True,
+                    'cv_indicators': cv_check['indicators']
+                }
+
+        # === KONTROLA VÝZKUMNÉ ZPRÁVY / PRŮZKUMU ===
+        if classifier_is_invoice and classifier_conf >= 0.5 and raw_text:
+            research_check = self._check_research_report(raw_text)
+            if research_check['is_research']:
+                logger.warning(f"  ⚠️ RESEARCH REPORT DETEKOVÁN: Text obsahuje znaky výzkumné zprávy ({research_check['indicators']})")
+                return {
+                    'is_invoice': False,
+                    'confidence': max(research_check['confidence'], 0.9),
+                    'decision_type': 'auto_reject',
+                    'weighted_score': 0.1,
+                    'agent_scores': {
+                        'classifier': 0.0,
+                        'extractor': 0.0,
+                        'anomaly': 1.0
+                    },
+                    'agent_agreement': {
+                        'full_agreement': True,
+                        'majority_agreement': True,
+                        'agreement_count': 3,
+                        'total_agents': 3
+                    },
+                    'reasoning': f"Dokument je výzkumná zpráva/průzkum - detekovány znaky: {', '.join(research_check['indicators'])}",
+                    'research_report_detected': True,
+                    'research_indicators': research_check['indicators']
+                }
+
+        # === RESPEKTOVAT VYSOKOU JISTOTU ZAMÍTNUTÍ OD CLASSIFIERU ===
+        # Pokud classifier zamítl dokument s vysokou jistotou (≥90%) a extractor
+        # nenašel kompletní data faktury, respektovat rozhodnutí classifieru.
+        # Tím se předejde situacím kdy extractor "halucinuie" data z CV/resumé.
+        if not classifier_is_invoice and classifier_conf >= 0.90:
+            # Počítat kolik polí extractor skutečně našel
+            if extractor_fields_found < 5:  # Nenašel všech 5 klíčových elementů
+                logger.info(f"  ✗ Classifier zamítl s vysokou jistotou ({classifier_conf:.0%}): {classifier_result.get('reasoning', 'N/A')}")
+                return {
+                    'is_invoice': False,
+                    'confidence': classifier_conf,
+                    'decision_type': 'auto_reject',
+                    'weighted_score': 1.0 - classifier_conf,  # Nízké skóre pro zamítnutí
+                    'agent_scores': {
+                        'classifier': classifier_conf,
+                        'extractor': extractor_completeness,
+                        'anomaly': 1 - anomaly_result.get('confidence', 0)
+                    },
+                    'agent_agreement': {
+                        'full_agreement': False,
+                        'majority_agreement': True,
+                        'agreement_count': 2,  # Classifier + Anomaly (pokud není anomálie)
+                        'total_agents': 3
+                    },
+                    'reasoning': f"Classifier zamítl s vysokou jistotou ({classifier_conf:.0%}): {classifier_result.get('reasoning', 'Neznámý důvod')} | Extractor našel pouze {extractor_fields_found} elementů (potřebuje ≥5)",
+                    'classifier_veto': True,
+                    'classifier_veto_reason': classifier_result.get('reasoning', 'Silný negativní indikátor')
+                }
+
+            # === KONTROLA HALUCINACE I PŘI 5+ POLECH ===
+            # Pokud chybí invoice_number NEBO bank_account, pravděpodobně jde o halucinaci
+            # (skutečné faktury téměř vždy mají číslo faktury nebo bankovní účet)
+            has_invoice_number = bool(extractor_result.get('invoice_number'))
+            has_bank_account = bool(extractor_result.get('bank_account'))
+            
+            if not has_invoice_number and not has_bank_account:
+                logger.info(f"  ✗ Classifier zamítl ({classifier_conf:.0%}) + chybí invoice_number i bank_account → HALUCINACE")
+                return {
+                    'is_invoice': False,
+                    'confidence': classifier_conf,
+                    'decision_type': 'auto_reject',
+                    'weighted_score': 1.0 - classifier_conf,
+                    'agent_scores': {
+                        'classifier': classifier_conf,
+                        'extractor': extractor_completeness,
+                        'anomaly': 1 - anomaly_result.get('confidence', 0)
+                    },
+                    'agent_agreement': {
+                        'full_agreement': False,
+                        'majority_agreement': True,
+                        'agreement_count': 2,
+                        'total_agents': 3
+                    },
+                    'reasoning': f"Classifier zamítl ({classifier_conf:.0%}): {classifier_result.get('reasoning', 'N/A')} | Extractor sice našel {extractor_fields_found} polí ALE chybí invoice_number i bank_account → HALUCINACE",
+                    'classifier_veto': True,
+                    'classifier_veto_reason': classifier_result.get('reasoning', 'Silný negativní indikátor')
+                }
+
         keyword_check = None
         if classifier_is_invoice and classifier_conf >= 0.5 and raw_text:
             keyword_check = self._check_invoice_keywords(raw_text)
             if not keyword_check['found']:
                 logger.warning(f"  ⚠️ RETRY: Classifier řekl JE faktura ({classifier_conf:.0%}) ale text neobsahuje invoice keywords!")
                 return {
-                    'is_invoice': None, 
+                    'is_invoice': None,
                     'confidence': 0.0,
                     'decision_type': 'retry',
                     'retry_reason': 'missing_invoice_keywords',
                     'keyword_analysis': keyword_check,
                     'reasoning': f"Classifier potvrdil fakturu ({classifier_conf:.0%}) ale text neobsahuje klíčová invoice slova. Nutná kontrola."
                 }
-
-        extractor_fields_found = sum([
-            1 if extractor_result.get('invoice_number') else 0,
-            1 if extractor_result.get('vendor_name') else 0,
-            1 if extractor_result.get('customer_name') else 0,
-            1 if extractor_result.get('issue_date') and extractor_result.get('issue_date') != '0000-00-00' else 0,
-            1 if extractor_result.get('due_date') and extractor_result.get('due_date') != '0000-00-00' else 0,
-            1 if extractor_result.get('total_amount') is not None or bool(extractor_result.get('total_amount_raw')) else 0,
-            1 if extractor_result.get('bank_account') else 0,
-        ])
-        
-        extractor_completeness = extractor_result.get('completeness_score', 0)
         elements = classifier_result.get('elements_present', {})
         has_identification = elements.get('identification', False)
         has_financial = elements.get('financial', False)
@@ -256,7 +318,7 @@ class ConsensusEngine:
                     'agreement_count': 1,
                     'total_agents': 3
                 },
-                'reasoning': f"Klasifikátor tvrdí že je to faktura ({classifier_conf:.0%}) ale Extraktor našel pouze {extractor_fields_found} elementy (vendor/customer/account) → Chybí datum nebo částka → Nutná lidská kontrola",
+                'reasoning': f"Klasifikátor tvrdí že je to faktura ({classifier_conf:.0%}) ale Extraktor našel pouze {extractor_fields_found} elementy. Chybí: {', '.join(missing_fields)} → Nutná lidská kontrola",
                 'extracted_data': self._extract_final_data(classifier_result, extractor_result),
                 'classifier_extractor_conflict': True
             }
@@ -287,7 +349,6 @@ class ConsensusEngine:
         if not classifier_is_invoice and extractor_fields_found >= 4:
             anomaly_type = anomaly_result.get('anomaly_type', '')
             
-            # VYLEPŠENÍ: Využíváme společný seznam anomálií ze třídy
             is_definite_non_invoice = any(
                 keyword in (anomaly_type or '').lower() 
                 for keyword in self.NON_INVOICE_ANOMALY_TYPES
@@ -343,25 +404,29 @@ class ConsensusEngine:
                     'extractor_hallucination_detected': True
                 }
 
-            logger.debug(f"  ✓ Classifier: NENÍ faktura ALE Extractor našel {extractor_fields_found} elementů (vč. částky {extracted_amount_raw or extracted_amount}) → JE FAKTURA (Extractor priorita)")
+            # === ZMĚNA ARCHITEKTURY (v7.5): Odstraněna Extractor Priorita ===
+            # Původně Extractor mohl přebít Klasifikátora pokud našel 4+ pole.
+            # To způsobovalo halucinace u paletových listů. Nyní to jde na HUMAN REVIEW.
+            logger.debug(f"  ⚠️ ROZPOR: Classifier: NENÍ faktura ALE Extractor našel {extractor_fields_found} elementů → HUMAN REVIEW")
             return {
-                'is_invoice': True,
-                'confidence': min(0.85, extractor_completeness + 0.1),
-                'decision_type': 'auto_accept',
-                'weighted_score': extractor_completeness,
+                'is_invoice': None,
+                'confidence': 0.5,
+                'decision_type': 'human_review',
+                'weighted_score': 0.5,
                 'agent_scores': {
-                    'classifier': 0.0,
+                    'classifier': 0.0, # Započítáno jako nesouhlas
                     'extractor': extractor_completeness,
                     'anomaly': 1 - anomaly_result.get('confidence', 0)
                 },
                 'agent_agreement': {
                     'full_agreement': False,
-                    'majority_agreement': True,
-                    'agreement_count': 2,
+                    'majority_agreement': False,
+                    'agreement_count': 1,
                     'total_agents': 3
                 },
-                'reasoning': f"Extractor našel {extractor_fields_found} elementů (≥4) vč. částky → JE FAKTURA i přes classifier",
-                'extracted_data': self._extract_final_data(classifier_result, extractor_result)
+                'reasoning': f"Rozpor: Klasifikátor zamítl dokument ALE Extraktor našel {extractor_fields_found} elementů (vč. částky) → Možná halucinace, nutná kontrola.",
+                'extracted_data': self._extract_final_data(classifier_result, extractor_result),
+                'classifier_extractor_conflict': True
             }
 
         if classifier_is_invoice and classifier_conf >= 0.7 and extractor_fields_found == 0:
@@ -386,6 +451,7 @@ class ConsensusEngine:
                 'extracted_data': {}
             }
 
+        # Tento blok byl v původním kódu prázdný (pass), nechávám jej pro úplnost
         if classifier_is_invoice and extractor_fields_found >= 1:
             pass
 
@@ -449,7 +515,6 @@ class ConsensusEngine:
             if not clf_is_invoice and clf_conf >= 0.5:
                 classifier_agrees = True
 
-        # VYLEPŠENÍ: Využíváme společný seznam anomálií ze třídy
         is_definite_non_invoice = any(
             keyword in (anomaly_type or '').lower() 
             for keyword in self.NON_INVOICE_ANOMALY_TYPES
@@ -675,70 +740,72 @@ class ConsensusEngine:
         }
 
     def _check_invoice_keywords(self, text: str) -> dict:
+        """Check for invoice keywords and return analysis."""
         text_lower = text.lower()
-        
+
+        # Use keywords from config, or fallback to defaults
         categories = {
             'identification': {
-                'cs': ['faktura', 'faktúry', 'daňový doklad', 'zálohová faktura', 'proforma'],
-                'en': ['invoice', 'tax document', 'proforma', 'bill']
+                'cs': [kw for kw in self.invoice_keywords_cs if 'faktura' in kw or 'doklad' in kw or 'proforma' in kw],
+                'en': [kw for kw in self.invoice_keywords_en if 'invoice' in kw or 'tax' in kw or 'bill' in kw]
             },
             'subjects': {
-                'cs': ['dodavatel', 'odběratel', 'objednatel', 'zhotovitel', 'ičo', 'dič', 's.r.o.', 'a.s.'],
-                'en': ['supplier', 'vendor', 'customer', 'contractor', 'vat', 'tax id', 'limited', 'inc.', 'gmbh']
+                'cs': [kw for kw in self.invoice_keywords_cs if kw in ['dodavatel', 'odběratel', 'objednatel', 'zhotovitel', 'ičo', 'dič', 's.r.o.', 'a.s.']],
+                'en': [kw for kw in self.invoice_keywords_en if kw in ['supplier', 'vendor', 'customer', 'contractor', 'vat', 'tax id', 'limited', 'inc.', 'gmbh']]
             },
             'dates': {
-                'cs': ['datum vystavení', 'datum splatnosti', 'vystaveno', 'splatnost', 'du', 'dv'],
-                'en': ['issue date', 'due date', 'date of issue', 'dated']
+                'cs': [kw for kw in self.invoice_keywords_cs if 'datum' in kw or 'splatnost' in kw or 'vystaveno' in kw],
+                'en': [kw for kw in self.invoice_keywords_en if 'date' in kw.lower() or 'dated' in kw]
             },
             'financial': {
-                'cs': ['celkem', 'k úhradě', 'částka', 'cena', 'úhrada', 'bez dph', 'dpH', 'sazba'],
-                'en': ['total', 'amount', 'price', 'payment', 'balance', 'excl. vat', 'incl. vat', 'subtotal']
+                'cs': [kw for kw in self.invoice_keywords_cs if kw in ['celkem', 'k úhradě', 'částka', 'cena', 'úhrada', 'bez dph', 'dpH', 'sazba']],
+                'en': [kw for kw in self.invoice_keywords_en if kw in ['total', 'amount', 'price', 'payment', 'balance', 'excl. vat', 'incl. vat', 'subtotal']]
             },
             'payment_info': {
-                'cs': ['variabilní symbol', 'banka', 'účet', 'iban', 'bic', 'swift'],
-                'en': ['payment reference', 'bank account', 'account no', 'iban', 'bic', 'swift']
+                'cs': [kw for kw in self.invoice_keywords_cs if kw in ['variabilní symbol', 'banka', 'účet', 'iban', 'bic', 'swift']],
+                'en': [kw for kw in self.invoice_keywords_en if 'payment' in kw or 'bank' in kw or 'account' in kw or kw in ['iban', 'bic', 'swift']]
             },
             'currency': {
-                'cs': ['kč', 'czk', 'eur', '€', 'usd', '$', '£', 'gbp'],
-                'en': ['eur', 'usd', 'gbp', 'czk', '€', '$', '£']
+                'cs': [kw for kw in self.invoice_keywords_cs if kw in ['kč', 'czk', 'eur', '€', 'usd', '$', '£', 'gbp']],
+                'en': [kw for kw in self.invoice_keywords_en if kw in ['eur', 'usd', 'gbp', 'czk', '€', '$', '£']]
             }
         }
-        
+
         found_keywords = []
         categories_found = []
         categories_missing = []
-        
+
         for category, keywords in categories.items():
             category_keywords = keywords['cs'] + keywords['en']
             found_in_category = [kw for kw in category_keywords if kw in text_lower]
-            
+
             if found_in_category:
                 found_keywords.extend(found_in_category)
                 categories_found.append(category)
             else:
                 categories_missing.append(category)
-        
+
         has_identification = 'identification' in categories_found
         has_financial = 'financial' in categories_found
-        
+
         category_score = len(categories_found) / len(categories)
-        
+
         critical_bonus = 0.0
         if has_identification:
             critical_bonus += 0.2
         if has_financial:
             critical_bonus += 0.2
-        
+
         final_score = min(1.0, category_score * 0.6 + critical_bonus)
-        
+
         is_found = (
             (has_identification and has_financial and len(categories_found) >= 3) or
             len(categories_found) >= 4
         )
-        
+
         if 'faktura' in text_lower or 'invoice' in text_lower:
             is_found = True
-        
+
         return {
             'found': is_found,
             'keywords_found': list(set(found_keywords)),
@@ -746,6 +813,130 @@ class ConsensusEngine:
             'score': round(final_score, 3),
             'categories_found': categories_found,
             'categories_missing': categories_missing
+        }
+
+    def _check_cv_resume(self, text: str) -> dict:
+        """Check if text contains CV/resume indicators."""
+        text_lower = text.lower()
+
+        # CV/Resume indicators from rules.yaml
+        cv_indicators = [
+            'professional profile',
+            'professional summary',
+            'career objective',
+            'core competencies',
+            'technical competencies',
+            'technical projects',
+            'professional working proficiency',
+            'curriculum vitae',
+            'curriculum',
+            'resume',
+            'work experience',
+            'education',
+            'skills',
+            'životopis',
+            'životopisy',
+            'pracovní zkušenosti',
+            'vzdělání',
+            'dovednosti',
+            'jazykové znalosti',
+        ]
+
+        # Additional CV patterns
+        cv_patterns = [
+            r'professional\s+profile',
+            r'core\s+technical\s+competenc(ies|y)',
+            r'technical\s+projects',
+            r'professional\s+working\s+proficiency',
+            r'curriculum\s+vitae?',
+            r'work\s+experience',
+            r'career\s+objective',
+        ]
+
+        found_indicators = []
+
+        # Check direct keywords
+        for indicator in cv_indicators:
+            if indicator in text_lower:
+                found_indicators.append(indicator)
+
+        # Check regex patterns
+        import re
+        for pattern in cv_patterns:
+            if re.search(pattern, text_lower) and pattern not in found_indicators:
+                found_indicators.append(f'regex:{pattern}')
+
+        # Calculate confidence based on number of indicators
+        confidence = 0.0
+        if found_indicators:
+            # More indicators = higher confidence
+            confidence = min(0.95, 0.5 + (len(found_indicators) * 0.15))
+
+        return {
+            'is_cv': len(found_indicators) >= 2,  # Need at least 2 indicators
+            'confidence': confidence,
+            'indicators': found_indicators,
+            'indicator_count': len(found_indicators)
+        }
+
+    def _check_research_report(self, text: str) -> dict:
+        """Check if text contains research report / survey indicators."""
+        text_lower = text.lower()
+
+        # Research report indicators
+        research_indicators = [
+            'mapování terénu',
+            'strategický pitch',
+            'průzkum českého',
+            'výzkumných skupin',
+            'pracovišť',
+            'český ai ekosystém',
+            'mapa české ai',
+            'tuzemského ekosystému',
+            'konzervativní umělé inteligence',
+            'explainable ai',
+            'medicínské ai',
+            'výzkumná zpráva',
+            'research report',
+            'survey',
+            'ekosystém',
+            'výzkumný tým',
+        ]
+
+        # Additional research report patterns
+        research_patterns = [
+            r'mapov[áa]n[íi]\s+ter[ée]nu',
+            r'pr[ůu]zkum\s+\w+',
+            r'ekosyst[ée]m',
+            r'v[ýy]zkumn[ýy]ch\s+skupin',
+            r'pracovi[šs][tť]',
+            r'strategick[ýy]\s+pitch',
+        ]
+
+        found_indicators = []
+
+        # Check direct keywords
+        for indicator in research_indicators:
+            if indicator in text_lower:
+                found_indicators.append(indicator)
+
+        # Check regex patterns
+        import re
+        for pattern in research_patterns:
+            if re.search(pattern, text_lower) and pattern not in found_indicators:
+                found_indicators.append(f'regex:{pattern}')
+
+        # Calculate confidence based on number of indicators
+        confidence = 0.0
+        if found_indicators:
+            # More indicators = higher confidence
+            confidence = min(0.95, 0.5 + (len(found_indicators) * 0.15))
+
+        return {
+            'is_research': len(found_indicators) >= 2,  # Need at least 2 indicators
+            'confidence': confidence,
+            'indicators': found_indicators,
+            'indicator_count': len(found_indicators)
         }
 
     def get_statistics(self, results: List[dict]) -> dict:

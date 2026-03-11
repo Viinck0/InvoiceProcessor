@@ -48,10 +48,13 @@ class InvoiceWorkflowState(TypedDict):
     # Input
     file_path: str
     raw_ocr_text: str
+    master_instruction: str
     
     # After validation
     validated_text: str
     validation_result: dict
+    text_blocks: list
+    enriched_text: str
     
     # After pre-filter
     pre_filter_result: tuple  # (classification, confidence, reason)
@@ -120,7 +123,8 @@ class InvoiceWorkflowNodes:
             
             return {
                 "validated_text": validated_text,
-                "validation_result": validation_result
+                "validation_result": validation_result,
+                "text_blocks": validation_result.get("valid_blocks", [])
             }
         
         except Exception as e:
@@ -161,56 +165,127 @@ class InvoiceWorkflowNodes:
     def classifier_node(self, state: InvoiceWorkflowState) -> InvoiceWorkflowState:
         """
         Node: Run classifier agent.
+
+        ARCHITEKTURA: Classifier dostává POUZE Markdown data (žádný surový text!)
         """
-        text = state.get("validated_text", "")
-        
-        if not text or state.get("skip_ai_processing"):
+        text_blocks = state.get("text_blocks", [])
+        markdown_input = state.get("enriched_text", "")
+
+        if not markdown_input or state.get("skip_ai_processing"):
             return {"classifier_result": {"is_invoice": False, "confidence": 0.0, "reason": "Skipped"}}
-        
+
         try:
-            result = self.classifier.analyze(text, metadata=None)
+            result = self.classifier.analyze(
+                markdown_input,
+                metadata=None,
+                text_blocks=text_blocks,
+                master_instruction=state.get("master_instruction")
+            )
             logger.debug(f"✓ Classifier: {'invoice' if result.get('is_invoice') else 'not invoice'} ({result.get('confidence', 0):.0%})")
             return {"classifier_result": result}
-        
+
         except Exception as e:
             logger.error(f"Classifier error: {e}")
             return {"classifier_result": {"is_invoice": False, "confidence": 0.0, "error": str(e)}}
-    
+
     def extractor_node(self, state: InvoiceWorkflowState) -> InvoiceWorkflowState:
         """
         Node: Run extractor agent.
+
+        ARCHITEKTURA: Extractor dostává POUZE Markdown data (žádný surový text!)
         """
-        text = state.get("validated_text", "")
-        
-        if not text or state.get("skip_ai_processing"):
+        markdown_input = state.get("enriched_text", "")
+
+        if not markdown_input or state.get("skip_ai_processing"):
             return {"extractor_result": {"completeness_score": 0.0, "validation_errors": ["Skipped"]}}
-        
+
         try:
-            result = self.extractor.analyze(text, metadata=None)
+            result = self.extractor.analyze(
+                markdown_input,
+                metadata=None,
+                master_instruction=state.get("master_instruction")
+            )
             logger.debug(f"✓ Extractor: completeness={result.get('completeness_score', 0):.0%}")
             return {"extractor_result": result}
-        
+
         except Exception as e:
             logger.error(f"Extractor error: {e}")
             return {"extractor_result": {"completeness_score": 0.0, "validation_errors": [str(e)]}}
-    
+
     def anomaly_node(self, state: InvoiceWorkflowState) -> InvoiceWorkflowState:
         """
         Node: Run anomaly detector agent.
+
+        ARCHITEKTURA: Anomaly detector dostává POUZE Markdown data (žádný surový text!)
         """
-        text = state.get("validated_text", "")
-        
-        if not text or state.get("skip_ai_processing"):
+        markdown_input = state.get("enriched_text", "")
+
+        if not markdown_input or state.get("skip_ai_processing"):
             return {"anomaly_result": {"is_anomaly": False, "confidence": 0.0}}
-        
+
         try:
-            result = self.anomaly.analyze(text, metadata=None)
+            result = self.anomaly.analyze(
+                markdown_input,
+                metadata=None,
+                master_instruction=state.get("master_instruction")
+            )
             logger.debug(f"✓ Anomaly: {'anomaly detected' if result.get('is_anomaly') else 'normal'} ({result.get('confidence', 0):.0%})")
             return {"anomaly_result": result}
-        
+
         except Exception as e:
             logger.error(f"Anomaly detector error: {e}")
             return {"anomaly_result": {"is_anomaly": False, "confidence": 0.0, "error": str(e)}}
+
+    def enrichment_node(self, state: InvoiceWorkflowState) -> InvoiceWorkflowState:
+        """
+        Node: Enrich text with Markdown table and spatial layout.
+
+        ARCHITEKTURA: Vytváří POUZE strukturovaná data pro agenty (žádný surový text!)
+        """
+        blocks = state.get("text_blocks", [])
+
+        if not blocks:
+            logger.debug("⏭️ Skipping enrichment (no blocks)")
+            return {"enriched_text": "", "master_instruction": ""}
+
+        try:
+            # Lazy import to avoid circular dependency
+            from core.engine import format_blocks_to_markdown_table, generate_master_instruction
+            md_table = format_blocks_to_markdown_table(blocks)
+            master_instruction = generate_master_instruction(blocks)
+
+            # Reconstruct spatial layout (using ClassifierAgent's method from BaseAgent)
+            mapped_blocks = []
+            for b in blocks:
+                bbox = b.get('bbox', {})
+                mapped_blocks.append({
+                    'text': b.get('text', ''),
+                    'x': float(bbox.get('x0', 0)),
+                    'y': float(bbox.get('y0', 0))
+                })
+
+            spatial_layout = ""
+            try:
+                spatial_layout = "\n\n### 📜 Vizualizace dokumentu (Reconstructed Layout)\n"
+                spatial_layout += "Toto je simulovaný vzhled stránky. Použij ho pro pochopení struktury.\n"
+                spatial_layout += "```\n"
+                spatial_layout += self.classifier.reconstruct_spatial_layout(mapped_blocks)
+                spatial_layout += "\n```\n"
+            except Exception as layout_err:
+                logger.warning(f"  ⚠️ Layout reconstruction failed: {layout_err}")
+
+            # ⚠️ ARCHITEKTURA: Pouze Markdown data pro agenty (žádný surový text!)
+            enriched = f"{md_table}\n\n{spatial_layout}".strip()
+            logger.debug(f"✓ Text enriched and master instruction generated")
+
+            return {
+                "enriched_text": enriched,
+                "master_instruction": master_instruction
+            }
+
+        except Exception as e:
+            logger.error(f"Enrichment error: {e}")
+            return {"enriched_text": "", "master_instruction": ""}
     
     def consensus_node(self, state: InvoiceWorkflowState) -> InvoiceWorkflowState:
         """
@@ -305,6 +380,7 @@ def build_invoice_workflow(
     # Add nodes
     workflow.add_node("ocr_validator", nodes.ocr_validator_node)
     workflow.add_node("pre_filter", nodes.pre_filter_node)
+    workflow.add_node("enrichment", nodes.enrichment_node)
     workflow.add_node("classifier", nodes.classifier_node)
     workflow.add_node("extractor", nodes.extractor_node)
     workflow.add_node("anomaly", nodes.anomaly_node)
@@ -321,10 +397,13 @@ def build_invoice_workflow(
         "pre_filter",
         should_skip_ai_processing,
         {
-            "skip_to_result": "consensus",  # Skip directly to consensus with empty results
-            "run_agents": ["classifier", "extractor", "anomaly"]  # Run all agents in parallel (next step)
+            "skip_to_result": "consensus",
+            "run_agents": "enrichment"
         }
     )
+    
+    # After enrichment, run all agents in parallel
+    workflow.add_edge("enrichment", ["classifier", "extractor", "anomaly"])
     
     # Send all agents to consensus afterwards
     workflow.add_edge("classifier", "consensus")
@@ -413,24 +492,46 @@ class SimpleInvoicePipeline:
         logger.debug(f"📋 Running pre-filter")
         state.update(self.nodes.pre_filter_node(state))
         
-        # Step 3: AI Agents (or skip)
+        # Step 3: Enrichment (if not skipped)
         if not state.get("skip_ai_processing"):
-            logger.debug(f"🤖 Running AI agents (Parallel)")
+            logger.debug(f"📋 Enriching text basis")
+            state.update(self.nodes.enrichment_node(state))
             
-            # Paralelní běh 3 agentů
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                classifier_future = executor.submit(self.nodes.classifier_node, state)
-                extractor_future = executor.submit(self.nodes.extractor_node, state)
-                anomaly_future = executor.submit(self.nodes.anomaly_node, state)
+        # Step 4: AI Agents (Sequential with Feedback Loop)
+        if not state.get("skip_ai_processing"):
+            logger.debug(f"🤖 Running AI agents (Sequential with Feedback Loop)")
+            
+            # 1. Classifier
+            logger.debug(f"  ⏳ Running Classifier...")
+            state.update(self.nodes.classifier_node(state))
+            clf_result = state.get("classifier_result", {})
+            is_invoice = clf_result.get("is_invoice", False)
+            
+            # 2. Anomaly Agent (verifying classifier)
+            logger.debug(f"  ⏳ Running Anomaly Detector...")
+            state.update(self.nodes.anomaly_node(state))
+            anom_result = state.get("anomaly_result", {})
+            refutes = anom_result.get("refutes_classifier", False)
+            
+            # 3. Extractor (Conditional)
+            if not is_invoice and not refutes:
+                logger.info("  ⏭️ Extractor skipped (Classifier rejected, Anomaly confirmed)")
+                state["extractor_result"] = {"completeness_score": 0.0, "validation_errors": ["Classifier rejected document"]}
+            else:
+                if not is_invoice and refutes:
+                    logger.warning("  🔄 FEEDBACK LOOP: Anomaly agent refuted Classifier rejection. Running Extractor and neutralizing Classifier.")
+                    state["classifier_result"]["is_invoice"] = True
+                    state["classifier_result"]["confidence"] = 0.5
+                    state["classifier_result"]["reasoning"] += " | (Vyvráceno Anomaly Agentem - nalezeny prvky faktury)"
+
+                logger.debug(f"  ⏳ Running Extractor...")
+                state.update(self.nodes.extractor_node(state))
                 
-                # Sběr výsledků
-                for future in concurrent.futures.as_completed([classifier_future, extractor_future, anomaly_future]):
-                    state.update(future.result())
         else:
             logger.debug(f"⏭️ Skipping AI processing (pre-filter rejected)")
             state["classifier_result"] = {"is_invoice": False, "confidence": 0.0, "reason": "Pre-filter reject"}
             state["extractor_result"] = {"completeness_score": 0.0, "validation_errors": ["Skipped"]}
-            state["anomaly_result"] = {"is_anomaly": False, "confidence": 0.0}
+            state["anomaly_result"] = {"is_anomaly": False, "confidence": 0.0, "refutes_classifier": False}
         
         # Step 4: Consensus
         logger.debug(f"🎯 Calculating consensus")
