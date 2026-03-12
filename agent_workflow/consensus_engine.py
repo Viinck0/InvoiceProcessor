@@ -14,6 +14,7 @@ Edit the YAML file to tune accuracy without modifying this code.
 """
 
 import logging
+import re
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -777,7 +778,11 @@ class ConsensusEngine:
 
         for category, keywords in categories.items():
             category_keywords = keywords['cs'] + keywords['en']
-            found_in_category = [kw for kw in category_keywords if kw in text_lower]
+            # Use regex with word boundaries for whole word matching only
+            found_in_category = [
+                kw for kw in category_keywords
+                if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE)
+            ]
 
             if found_in_category:
                 found_keywords.extend(found_in_category)
@@ -803,7 +808,9 @@ class ConsensusEngine:
             len(categories_found) >= 4
         )
 
-        if 'faktura' in text_lower or 'invoice' in text_lower:
+        # Use regex with word boundaries for whole word matching only
+        if re.search(r'\b' + re.escape('faktura') + r'\b', text_lower, re.IGNORECASE) or \
+           re.search(r'\b' + re.escape('invoice') + r'\b', text_lower, re.IGNORECASE):
             is_found = True
 
         return {
@@ -855,13 +862,12 @@ class ConsensusEngine:
 
         found_indicators = []
 
-        # Check direct keywords
+        # Check direct keywords - using word boundaries for whole word matching
         for indicator in cv_indicators:
-            if indicator in text_lower:
+            if re.search(r'\b' + re.escape(indicator) + r'\b', text_lower, re.IGNORECASE):
                 found_indicators.append(indicator)
 
         # Check regex patterns
-        import re
         for pattern in cv_patterns:
             if re.search(pattern, text_lower) and pattern not in found_indicators:
                 found_indicators.append(f'regex:{pattern}')
@@ -915,13 +921,12 @@ class ConsensusEngine:
 
         found_indicators = []
 
-        # Check direct keywords
+        # Check direct keywords - using word boundaries for whole word matching
         for indicator in research_indicators:
-            if indicator in text_lower:
+            if re.search(r'\b' + re.escape(indicator) + r'\b', text_lower, re.IGNORECASE):
                 found_indicators.append(indicator)
 
         # Check regex patterns
-        import re
         for pattern in research_patterns:
             if re.search(pattern, text_lower) and pattern not in found_indicators:
                 found_indicators.append(f'regex:{pattern}')

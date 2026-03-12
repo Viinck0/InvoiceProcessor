@@ -18,6 +18,7 @@ from typing import Optional
 import logging
 import re
 from .base_agent import BaseAgent
+from .agent_memory import get_shared_memory
 
 # Import configuration loader
 try:
@@ -46,80 +47,133 @@ class ExtractorAgent(BaseAgent):
     Optimized for speed and Markdown output compliance.
     """
 
-    EXTRACTION_PROMPT = """Jsi AI pro extrakci dat z faktur. VRAT POUZE MARKDOWN.
+    # English-only prompt for invoice data extraction
+    EXTRACTION_PROMPT = """
+=== INVOICE DATA EXTRACTION ===
+You are an AI for invoice data extraction. RETURN ONLY MARKDOWN.
+The document might be in Czech or English.
 
-=== PRIMÁRNÍ ZDROJ DAT (HLAVNÍ PODKLAD) ===
-Tvým nejdůležitějším zdrojem je sekce "🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction)".
-Obsahuje text seřazený do logických bloků s označením pozice:
-* **[vlevo]**: Informace v levém sloupci (často dodavatel).
-* **[vpravo]**: Informace v pravém sloupci (často odběratel, datum, částka).
+=== PRIMARY DATA SOURCE ===
+Your MOST IMPORTANT source is "🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction)".
+Contains text sorted into logical blocks with position labels:
+* **[vlevo]**: Information in left column (often supplier).
+* **[vpravo]**: Information in right column (often customer, date, amount).
 
-=== KRITICKÉ ANTI-HALUCINAČNÍ PRAVIDLO ===
-NESMÍŠ si VYMÝŠLET hodnoty! Extrahuj POUZE to, co je explicitně v textu.
-Pokud hodnotu nevidíš v textu, vrať null. NIKDY nepoužívej vzorové hodnoty!
-Jako dodavatele nebo odběratele NIKDY neextrahuj pouhý název města (např. "Praha", "Brno"). Musí jít o jméno firmy nebo osoby.
+=== CRITICAL ANTI-HALLUCINATION RULE ===
+You MUST NOT INVENT values! Extract ONLY what is explicitly in the text. DO NOT TRANSLATE extract values into English, extract them EXACTLY as they appear, keeping Czech words if they are Czech.
+If you don't see a value in text, return null. NEVER use template values!
+NEVER extract just city name (e.g. "Prague", "Brno", "Praha") as supplier or customer.
+Must be company name or person name.
 
-=== PRAVIDLA EXTRAKCE ===
-1. **Důslednost:** Extrahuj data přesně tak, jak jsou v dokumentu. Neměň diakritiku, pokud je v textu správně.
-2. **Dodavatel vs Odběratel:**
-   - Hledej v horní části dokumentu.
-   - Dodavatel je ten, kdo fakturu vystavil (často vlevo nahoře, označen jako "Dodavatel").
-   - Odběratel je ten, komu je fakturováno (často vpravo nahoře nebo uprostřed, označen jako "Odběratel").
-3. **Adresy - KLÍČOVÉ:**
-   - Adresa se skládá z ULICE + ČÍSLO POPISNÉ + MĚSTO + PSČ.
-   - Hledej řádky POD jménem dodavatele/odběratele ve STEJNÉM sloupci.
-   - Adresa může být rozdělena na více řádků (ulice na jednom řádku, město na dalším).
-   - Příklad: "Ulice 111" + "111Mesto-priklad" = plná adresa.
-   - NEextrahuj IČO/DIČ jako adresu!
-4. **Částka:** Extrahuj CELKOVOU částku k úhradě. Pokud je jich více, hledej slova jako "Celkem", "K úhradě", "Grand Total". Vytáhni pouze číslo.
-5. **Měna:** Extrahuj kód měny (CZK, EUR, atd.).
-6. **LOGISTICKÉ REPORTY (ZÁKAZ):** Pokud dokument vypadá jako report naskládání palet, seznam zboží v kamionu nebo jiný logistický výpis (obsahuje počty kusů, váhy, ale CHYBÍ jasný dodavatel, odběratel a ceny za položku) → VRAŤ PRÁZDNÁ POLE (null). Nepokoušej se mapovat kusy nebo váhy na částky faktury!
-7. **IGNOROVÁNÍ NÁPOVĚD V CHYBÁCH:** Sekce Validation Errors slouží jen pro skutečné problémy. NIKDY do ní nekopíruj text z instrukcí a nápověd (např. "k nalezení:").
+=== EXTRACTION RULES ===
+1. **Consistency:** Extract data exactly as they appear in the document. Don't change diacritics.
 
-=== FORMÁT VÝSTUPU (STRIKTNÍ MARKDOWN) ===
-- ODPOVÍDEJ POUZE V MARKDOWN TABULKÁCH.
-- **ZÁKAZ JSONu:** Naprostý zákaz použití složených závorek {{}} nebo formátu JSON kdekoli ve výstupu (včetně reasoning).
-- Žádný doprovodný text mimo markdown.
-- **DŮLEŽITÉ:** Pokud do tabulky nebo textu potřebuješ napsat znak svislítka `|`, MUSÍŠ ho zapsat s lomítkem jako `\\|`.
+2. **Supplier vs Customer:**
+   - Search in upper part of document.
+   - Supplier is who issued the invoice.
+   - Customer is who is being billed.
 
-Použij PŘESNĚ následující strukturu:
+3. **Addresses - CRITICAL:**
+   - Address consists of STREET + HOUSE NUMBER + CITY + ZIP CODE.
+   - Search for lines BELOW supplier/customer name in SAME column.
+   - Address may be split across multiple lines.
+   - Example: "Ulice 111" + "111 Mesto" = full address.
+   - DON'T extract ICO/DIC as address!
 
-## 📋 Extrahovaná data
-| Pole | Hodnota |
+4. **Amount:** Extract TOTAL amount due.
+   If multiple, search for words like: "Celkem", "K úhradě", "Grand Total", "Total", "Amount Due".
+   Extract only the number.
+
+5. **Currency:** Extract currency code (CZK, EUR, USD, etc.).
+
+6. **LOGISTICS REPORTS - BAN:**
+   If document looks like pallet loading report, truck cargo list, or other logistics report:
+   (contains piece counts, weights, but MISSING clear supplier, customer and item prices)
+   → RETURN EMPTY FIELDS (null).
+   Don't try to map pieces or weights to invoice amounts!
+
+7. **NO PROMPT COPYING:**
+   Validation Errors section is only for real problems.
+   NEVER copy text from instructions and hints (e.g. "to find:").
+
+=== OUTPUT FORMAT (STRICT MARKDOWN) ===
+- Respond ONLY IN EXACTLY ONE MARKDOWN TABLE for Extracted Data.
+- DO NOT use bullet points or lists for the extracted data!
+- **NO JSON:** Absolute ban on curly braces {{}} or JSON format anywhere.
+- No accompanying text outside markdown.
+- **IMPORTANT:** If you need to write pipe character `|`, you MUST write it as `\\|`.
+
+=== EXAMPLE OF EXPECTED OUTPUT ===
+## 📋 Extracted Data
+| Field | Value |
 |------|---------|
-| Invoice Number | číslo nebo null |
-| Vendor Name | název dodavatele nebo null |
-| Vendor Address | adresa dodavatele nebo null |
-| Customer Name | název odběratele nebo null |
-| Customer Address | adresa odběratele nebo null |
-| Issue Date | YYYY-MM-DD nebo null |
-| Due Date | YYYY-MM-DD nebo null |
-| Total Amount | číslo nebo null |
-| Currency | CZK/EUR/USD nebo null |
-| VAT Amount | číslo nebo null |
-| Base Amount | číslo nebo null |
-| Bank Account | účet nebo null |
-| Variable Symbol | VS nebo null |
-| Total Amount Raw | částka s měnou nebo null |
-| Vendor IČO | IČO nebo null |
-| Vendor DIČ | DIČ nebo null |
-| Customer IČO | IČO nebo null |
+| Invoice Number | 2023001 |
+| Vendor Name | Example Corp s.r.o. |
+| Vendor Address | Test Street 123, 11000 Prague |
+| Customer Name | John Doe |
+| Customer Address | Nice Ave 45, 60200 Brno |
+| Issue Date | 2023-10-25 |
+| Due Date | 2023-11-08 |
+| Total Amount | 1500.50 |
+| Currency | CZK |
+| VAT Amount | 315.10 |
+| Base Amount | 1185.40 |
+| Bank Account | 123456789/0100 |
+| Variable Symbol | 2023001 |
+| Total Amount Raw | 1500.50 CZK |
+| Vendor IČO | 12345678 |
+| Vendor DIČ | CZ12345678 |
+| Customer IČO | null |
+
+**Completeness Score:** 0.95
+
+## ⚠️ Validation Errors
+- [Missing customer IČO]
+
+## 🧠 Reasoning & Location
+Vendor found in top block [vlevo]...
+Customer address: lines below name in column [vpravo]...
+
+=== USE EXACTLY THIS STRUCTURE ===
+
+## 📋 Extracted Data
+| Field | Value |
+|------|---------|
+| Invoice Number | number or null |
+| Vendor Name | supplier name or null |
+| Vendor Address | supplier address or null |
+| Customer Name | customer name or null |
+| Customer Address | customer address or null |
+| Issue Date | YYYY-MM-DD or null |
+| Due Date | YYYY-MM-DD or null |
+| Total Amount | number or null |
+| Currency | CZK/EUR/USD or null |
+| VAT Amount | number or null |
+| Base Amount | number or null |
+| Bank Account | account or null |
+| Variable Symbol | VS or null |
+| Total Amount Raw | amount with currency or null |
+| Vendor IČO | IČO or null |
+| Vendor DIČ | DIČ or null |
+| Customer IČO | IČO or null |
 
 **Completeness Score:** 0.8
 
 ## ⚠️ Validation Errors
-- [Zde vypiš stručný seznam chybějících polí nebo problémů. Žádné nápovědy!]
+- [Brief list of missing fields or problems. No hints!]
 
-## 🧠 Reasoning & Lokace
-[Stručný popis, kde jsi data našel v Master Instrukci - např. "Dodavatel nalezen v horním bloku [vlevo]...", "Adresa odběratele: řádky pod jménem ve sloupci [vpravo]: Ulice 777, 99955Mesto-priklad"]
+## 🧠 Reasoning & Location
+[Brief description where you found data in Master Instruction]
+e.g.: "Supplier found in top block [vlevo]..."
+"Customer address: lines below name in column [vpravo]: Street 777, 99955 City"
 
-=== STRUKTURA VSTUPU ===
-1. 🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction): Tvůj HLAVNÍ zdroj pro pochopení struktury.
-2. 📋 Tabulka textových bloků: Přehledová tabulka (Cislo, Pozice, Text).
-3. 📜 VIZUALIZACE DOKUMENTU: Pokus o grafickou rekonstrukci vzhledu.
-4. SUROVÝ TEXT: Surová data dokumentu.
+=== INPUT STRUCTURE ===
+1. 🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction): Your MAIN source
+2. 📋 Tabulka textových bloků / Text blocks table: Summary of all parts
+3. 📜 VIZUALIZACE DOKUMENTU / DOCUMENT VISUALIZATION: Attempt at graphic reconstruction
+4. SUROVÝ TEXT / RAW TEXT: Raw data
 
-{classifier_info}=== TEXT DOKUMENTU ===
+{classifier_info}=== DOCUMENT TEXT ===
 {input_data}"""
 
     def __init__(self, model: str = "llama3.2", timeout: int = 60, vram_limit_gb: int = None, num_ctx: int = None):
@@ -220,14 +274,14 @@ Použij PŘESNĚ následující strukturu:
             master_instruction_section = f"=== MASTER INSTRUCTION (IMPORTANT) ===\n{master_instruction}\n\n" if master_instruction else ""
             
             base_prompt = self.EXTRACTION_PROMPT.replace(
-                "=== STRUKTURA VSTUPU ===",
-                master_instruction_section + "=== STRUKTURA VSTUPU ==="
+                "=== INPUT STRUCTURE ===",
+                master_instruction_section + "=== INPUT STRUCTURE ==="
             )
 
             if classifier_info:
                 prompt = base_prompt.replace(
                     "{classifier_info}", 
-                    f"=== DODATEČNÉ INFORMACE OD CLASSIFIERU ===\n{classifier_info}\nPoužij tyto informace pro lepší extrakci.\n\n"
+                    f"=== ADDITIONAL INFO FROM CLASSIFIER ===\n{classifier_info}\nUse this information for better extraction.\n\n"
                 ).replace(
                     "{input_data}", truncated
                 )
@@ -292,6 +346,23 @@ Použij PŘESNĚ následující strukturu:
             result = self._verify_extraction(result, markdown_input, exclude_fields=exclude_from_verify)
 
             result['completeness_score'] = self._calculate_completeness(result)
+            
+            # Store reasoning in shared memory
+            try:
+                memory = get_shared_memory()
+                memory.store_reasoning(
+                    agent_name="extractor",
+                    reasoning=result.get('reasoning', ''),
+                    confidence=result.get('completeness_score', 0.0),
+                    is_invoice=None,  # Extractor doesn't make invoice decision
+                    metadata={
+                        'extracted_data': {k: v for k, v in result.items() if k not in ['reasoning', 'validation_errors']},
+                        'validation_errors': result.get('validation_errors', [])
+                    }
+                )
+            except Exception as mem_err:
+                logger.warning(f"Failed to store extractor reasoning in shared memory: {mem_err}")
+            
             return result
 
         except Exception as e:
@@ -306,11 +377,11 @@ Použij PŘESNĚ následující strukturu:
         result = self._empty_result()
         has_data = False
 
-        # Preferuj parsování pouze tabulky "Extrahovaná data".
+        # Preferuj parsování pouze tabulky "Extracted Data"
         # Tím eliminujeme riziko, že parser omylem sebere jinou tabulku.
         # Fallback: pokud sekci nenajdeme, parsujeme celý text (legacy).
         def _extract_extracted_data_section(md: str) -> str:
-            m = re.search(r'(?is)##\s*[^\n]*extrahovan[áa]\s+data\s*\n(.*?)(?:\n##\s+|\Z)', md)
+            m = re.search(r'(?is)##\s*[^\n]*extracted\s+data|##\s*[^\n]*extrahovan[áa]\s+data\s*\n(.*?)(?:\n##\s+|\Z)', md)
             return (m.group(1).strip() if m else "")
 
         md_for_table = _extract_extracted_data_section(markdown_text)
@@ -408,7 +479,6 @@ Použij PŘESNĚ následující strukturu:
     def _fallback_markdown_parse(self, raw_output: str) -> Optional[dict]:
         """Záchrana v případě, že LLM nedodrží formát tabulky a vypíše seznam."""
         result = {}
-        
         patterns_map = {
             'invoice_number': [r'[-•]?\s*Invoice number[:\s]+([^\n]+)', r'[-•]?\s*Číslo faktury[:\s]+([^\n]+)'],
             'vendor_name': [r'[-•]?\s*Vendor name[:\s]+([^\n]+)', r'[-•]?\s*Dodavatel[:\s]+([^\n]+)'],

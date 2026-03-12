@@ -608,24 +608,31 @@ class OCRExtractor:
                         if text.strip():
                             # Normalizovat bbox_coords na flat list [x0, y0, x1, y1]
                             # Může být: [x0, y0, x1, y1] nebo [[x0,y0], [x1,y0], [x1,y1], [x0,y1]]
-                            if len(bbox_coords) == 4 and all(isinstance(p, list) for p in bbox_coords):
-                                # 4 corner points - převést na [x0, y0, x1, y1]
-                                x0, y0 = bbox_coords[0]
-                                x1, _ = bbox_coords[1]
-                                _, y1 = bbox_coords[2]
-                                flat_coords = [x0, y0, x1, y1]
-                            elif len(bbox_coords) >= 4:
-                                flat_coords = list(bbox_coords)
-                            else:
+                            try:
+                                if len(bbox_coords) == 4 and all(isinstance(p, list) for p in bbox_coords):
+                                    # 4 corner points - převést na [x0, y0, x1, y1]
+                                    x0, y0 = bbox_coords[0]
+                                    x1, _ = bbox_coords[1]
+                                    _, y1 = bbox_coords[2]
+                                    flat_coords = [float(x0), float(y0), float(x1), float(y1)]
+                                elif len(bbox_coords) >= 4:
+                                    flat_coords = [float(c) for c in list(bbox_coords)[:4]]
+                                else:
+                                    flat_coords = [0.0, 0.0, 0.0, 0.0]
+                            except (TypeError, ValueError, IndexError):
+                                flat_coords = [0.0, 0.0, 0.0, 0.0]
+
+                            # Robust: always ensure exactly 4 valid floats
+                            if len(flat_coords) < 4 or not all(isinstance(c, (int, float)) for c in flat_coords[:4]):
                                 flat_coords = [0.0, 0.0, 0.0, 0.0]
 
                             text_blocks.append({
                                 "text": text.strip(),
                                 "bbox": {
-                                    "x0": flat_coords[0] / OCR_ZOOM if len(flat_coords) > 0 else 0.0,
-                                    "y0": flat_coords[1] / OCR_ZOOM if len(flat_coords) > 1 else 0.0,
-                                    "x1": flat_coords[2] / OCR_ZOOM if len(flat_coords) > 2 else 0.0,
-                                    "y1": flat_coords[3] / OCR_ZOOM if len(flat_coords) > 3 else 0.0
+                                    "x0": flat_coords[0] / OCR_ZOOM,
+                                    "y0": flat_coords[1] / OCR_ZOOM,
+                                    "x1": flat_coords[2] / OCR_ZOOM,
+                                    "y1": flat_coords[3] / OCR_ZOOM
                                 },
                                 "confidence": confidence,
                                 "source": "ocr"
@@ -885,7 +892,7 @@ class MultiAgentProcessor:
                     # Upravíme výsledek Classifieru aby systém nezamítl správnou fakturu
                     classifier_result["is_invoice"] = True
                     classifier_result["confidence"] = 0.5  # Neutrální confidence
-                    classifier_result["reasoning"] += " | (Vyvráceno Anomaly Agentem - nalezeny prvky faktury)"
+                    classifier_result["reasoning"] = classifier_result.get("reasoning", "") + " | (Vyvráceno Anomaly Agentem - nalezeny prvky faktury)"
 
                 logger.debug(f"  ⏳ Extractor (s feedback loop logikou)...")
                 try:

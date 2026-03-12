@@ -19,6 +19,7 @@ from typing import Optional
 import logging
 import re
 from .base_agent import BaseAgent
+from .agent_memory import get_shared_memory
 
 # Import configuration loader
 try:
@@ -53,85 +54,86 @@ class ClassifierAgent(BaseAgent):
     5. Payment instructions
     """
     
-    CLASSIFICATION_PROMPT = """Jsi expertní systém pro klasifikaci dokumentů. Tvým JEDINÝM úkolem je na základě obsahu rozhodnout, zda se jedná o fakturu.
+    # English-only prompt for invoice classification that understands Czech layout and entities
+    CLASSIFICATION_PROMPT = """
+=== INVOICE CLASSIFICATION SYSTEM ===
+You are an expert document classification system. Your ONLY task is to decide if this is an invoice.
+The document might be in Czech or English.
 
-=== KRITICKÉ PRAVIDLO - FORMÁT ODPOVĚDI ===
-⚠️ TVÁ ODPOVĚĎ MUSÍ ZAČÍNAT OKAMŽITĚ: "## 📊 Klasifikace dokumentu"
-⚠️ NIKDY nepopisuj vzhled dokumentu, fonty, barvy nebo layout!
-⚠️ NIKDY nepiš úvodní věty jako "Vzhled dokumentu...", "Tento dokument...", "Analýza dokumentu..."!
-⚠️ Pokud začneš popisovat dokument místo klasifikace, selhal jsi!
+=== CRITICAL RULE - RESPONSE FORMAT ===
+⚠️ YOUR RESPONSE MUST START IMMEDIATELY: "## 📊 Document Classification"
+⚠️ NEVER describe document appearance, fonts, colors, or layout!
+⚠️ NEVER write introductory sentences like "Document appearance...", "This document...", "Document analysis..."!
 
-=== KRITICKÉ PRAVIDLO - ROZPOZNÁNÍ FAKTURY ===
-⚠️ POKUD dokument obsahuje "faktura", "daňová faktura", "invoice", "tax document" → is_invoice = TRUE
-⚠️ POKUD dokument obsahuje dodavatele (firma) a odběratele (osoba/firma) → is_invoice = TRUE
-⚠️ POKUD dokument obsahuje částku (i když je 0,00) → is_invoice = TRUE
+=== CRITICAL RULE - INVOICE RECOGNITION ===
+⚠️ IF document contains "faktura", "daňová faktura", "invoice", "tax document" → is_invoice = TRUE
+⚠️ IF document contains supplier (company) and customer (person/company) → is_invoice = TRUE
+⚠️ IF document contains amount (even if 0.00) → is_invoice = TRUE
 
-=== KRITICKÉ PRAVIDLO - CO NENÍ FAKTURA ===
-Pokud dokument obsahuje typické znaky jiných dokumentů (např. {negative_keywords}, nebo jiný nesouvisející text), MUSÍŠ vrátit is_invoice: false a všechny hodnoty v tabulce hodnot musí být null. NIKDY neoznačuj tyto dokumenty jako fakturu.
+=== CRITICAL RULE - WHAT IS NOT AN INVOICE ===
+If document contains typical signs of other documents (e.g. {negative_keywords}), you MUST return is_invoice: false.
+NEVER mark these documents as invoices.
 
-=== KRITICKÉ PRAVIDLO - EXTRAKCE HODNOT ===
-Pokud JE dokument skutečně faktura, tvým úkolem je EXTRAKOVAT konkrétní hodnoty z textu.
-Všechny hodnoty MUSÍ být doslovně převzaty z analyzovaného dokumentu.
-NIKDY si nevymýšlej data. NIKDY nepoužívej hodnoty které nejsou v dokumentu.
+=== CRITICAL RULE - VALUE EXTRACTION ===
+If this IS truly an invoice, your task is to EXTRACT specific values from the text.
+All values MUST be literally taken from the analyzed document. DO NOT TRANSLATE THEM. Make sure to keep Czech words if they are in the document.
+NEVER invent data. NEVER use values that are not in the document.
 
-ABSOLUTNÍ ZÁKAZ KOPÍROVÁNÍ ZADÁNÍ: Do tabulky "Extrahované hodnoty" NIKDY neopisuj text ze zadání (např. NIKDY nepiš "hodnota z textu nebo null").
-Pokud hodnotu najdeš, vypiš její SKUTEČNÉ ZNĚNÍ (např. "Alza s.r.o." nebo "2500 Kč").
-Pokud hodnotu nenajdeš, napiš POUZE slovo: null
+ABSOLUTE BAN ON COPYING PROMPT:
+In "Extracted Values" table NEVER copy text from the prompt.
+If you find a value, write its ACTUAL TEXT (e.g. "Alza s.r.o." or "2500 Kč").
+If you don't find a value, write ONLY the word: null
 
-=== ABSOLUTNÍ ZÁKAZ PRO HODNOTY - ŠTÍTKY ===
-⚠️ NIKDY neextrahuj ŠTÍTKY jako hodnoty! Štítky poznáš podle těchto slov:
+=== ABSOLUTE BAN ON LABELS AS VALUES ===
+⚠️ NEVER extract LABELS as values!
 
-ZAKÁZANÉ ŠTÍTKY PRO DODAVATELE/ODBĚRATELE:
-- "Datum účinnosti", "Datum transakce", "ID transakce" → To jsou DATUMY/ID, ne firmy!
-- "Číslo faktury", "Číslo zákazníka", "ID zákazníka" → To jsou ČÍSLA, ne firmy!
-- "Daňové číslo", "DIČ", "IČO", "VAT" → To jsou ČÍSLA, ne firmy!
-- "Variabilní symbol", "Konstantní symbol" → To jsou ČÍSLA, ne firmy!
-- "E-mail kupujícího", "E-mail odběratele" → To jsou EMAILY, ne firmy!
-- "Platební metoda", "Frekvence účtování" → To jsou POPISY, ne firmy!
+FORBIDDEN LABELS (Supplier/Customer) - DO NOT EXTRACT THESE AS COMPANIES:
+- "Datum účinnosti", "Datum transakce", "ID transakce" / "Effective Date", "Transaction Date", "Transaction ID" → These are DATES/IDs, not companies!
+- "Číslo faktury", "Číslo zákazníka", "ID zákazníka" / "Invoice Number", "Customer Number", "Customer ID" → These are NUMBERS, not companies!
+- "Daňové číslo", "DIČ", "IČO", "VAT" → These are NUMBERS, not companies!
+- "Variabilní symbol", "Konstantní symbol" / "Variable Symbol", "Constant Symbol" → These are NUMBERS
+- "E-mail kupujícího", "E-mail odběratele" / "Buyer Email", "Customer Email" → These are EMAILS
+- "Platební metoda", "Frekvence účtování" / "Payment Method", "Billing Frequency" → These are DESCRIPTIONS
 
-SPRÁVNÁ EXTRAKCE:
+CORRECT EXTRACTION:
 - "[vlevo] Daňová faktura z LinkedIn Ireland Unlimited Company" → supplier = "LinkedIn Ireland Unlimited Company"
 - "[vlevo] Václav Krajkář" → customer = "Václav Krajkář"
 - "[vlevo] Polní 216, Teplice" → address = "Polní 216, Teplice"
 - "[vpravo] 26. 2. 2026" → date = "26. 2. 2026"
 - "[vpravo] 0,00 Kč" → amount = "0,00 Kč"
 
-Pokud za slovem "Odběratel:" nebo "Dodavatel:" následuje slovo jako "ze dne", "IČO", "DIČ", "Datum" nebo "Faktura", znamená to, že jméno na daném řádku chybí. V takovém případě VRAŤ null. Nikdy neextrahuj "ze dne" nebo podobné štítky jako jméno firmy!
+=== PRIMARY DATA SOURCE: MASTER INSTRUCTION ===
+Your MOST IMPORTANT section is "🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction)".
+This section contains text sorted into logical blocks with position labels [vlevo] (left) or [vpravo] (right).
+* **[vlevo]**: Information in left column (often sender, company details).
+* **[vpravo]**: Information in right column (often customer, date, amount).
+* **Order**: Blocks follow each other as they appear on the document from top to bottom.
 
-=== PRIMÁRNÍ ZDROJ DAT: MASTER INSTRUCTION (PLNÝ TEXT PODLE SOUŘADNIC) ===
-Tvou nejdůležitější sekcí je "🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction)". Tato sekce obsahuje text již seřazený do logických bloků s označením pozice [vlevo] nebo [vpravo].
-* **[vlevo]**: Informace v levém sloupci (často odesílatel, detaily firmy).
-* **[vpravo]**: Informace v pravém sloupci (často odběratel, datum, částka).
-* **Pořadí**: Bloky jdou za sebou tak, jak jsou fyzicky na dokumentu odshora dolů.
-
-=== POSTUP ANALÝZY ===
-1. PŘEDNOSTNĚ si prohlédni sekci "🎯 PLNÝ TEXT PODLE SOUŘADNIC". Na základě [vlevo]/[vpravo] pochop strukturu dokumentu.
-2. HLEDEJ KLÍČOVÁ SLOVA:
+=== ANALYSIS PROCEDURE ===
+1. FIRST, examine "🎯 PLNÝ TEXT PODLE SOUŘADNIC" section. Understand structure from [vlevo]/[vpravo].
+2. SEARCH FOR KEYWORDS:
    - "faktura", "invoice", "daňová faktura" → is_invoice = TRUE
-   - "[vlevo] Firma" nebo "[vlevo] Jméno" → potential supplier/customer
-   - "[vpravo] Částka" nebo "[vpravo] Cena" → amount
-   - "[vlevo/vpravo] Datum" → date
-3. Pokud to není faktura (např. obsahuje slova ze zakázaného seznamu), rovnou označ "Je faktura: ❌ NE" a všechny hodnoty dej jako null.
-4. Pokud je to faktura, hledej hodnoty primárně v seřazených bloccích:
-   - Dodavatel bývá často v bloku [vlevo] nahoře (název firmy).
-   - Odběratel bývá často v bloku [vlevo] nebo [vpravo] (jméno nebo firma).
-   - Částka a datum jsou v odpovídajících řádcích [vpravo] nebo [vlevo].
-5. Pokud hodnotu nenajdeš → vrať null.
+   - "[vlevo] Firma" or "[vlevo] Jméno" or "[vlevo] Company" or "[vlevo] Name" → potential supplier/customer
+   - "[vpravo] Částka" or "[vpravo] Cena" or "[vpravo] Amount" or "[vpravo] Price" → amount
+   - "[vlevo/vpravo] Datum" or "[vlevo/vpravo] Date" → date
+3. If not an invoice (contains forbidden words), mark "Is Invoice: ❌ NO" and values = null.
+4. If it is an invoice, search for values primarily in sorted blocks.
+5. If you don't find a value → return null.
 
-=== PRAVIDLA PRO REASONING A FORMATOVANI ===
-- Reasoning MUSÍ být STRUČNÝ (max 3-4 věty). Uveď klíčové poznatky z Master Instrukce (co leží vlevo/vpravo).
-- ODPOVÍDEJ POUZE VE FORMÁTU MARKDOWN. Naprostý zákaz JSONu (nepoužívej {{}}).
-- **ZÁKAZ JSONu i v Reasoning:** Nikdy nepiš technický JSON kód do vysvětlení!
-- **ŽÁDNÉ ÚVODNÍ VĚTY:** Okamžitě začni s "## 📊 Klasifikace dokumentu"
+=== REASONING AND FORMATTING RULES ===
+- Reasoning MUST be BRIEF (max 3-4 sentences). State key findings from Master Instruction.
+- Respond ONLY IN MARKDOWN FORMAT. Absolute ban on JSON (don't use {{}}).
+- **NO JSON in Reasoning:** Never write technical JSON code in explanation!
+- **NO INTRODUCTORY SENTENCES:** Immediately start with "## 📊 Document Classification"
 
-Použij PŘESNĚ následující strukturu:
+=== USE EXACTLY THIS STRUCTURE ===
 
-## 📊 Klasifikace dokumentu
-**Je faktura:** ✅ ANO / ❌ NE
+## 📊 Document Classification
+**Is Invoice:** ✅ YES / ❌ NO
 **Confidence:** 0.85
 
-## 🔍 Elementy
-| Element | Přítomen |
+## 🔍 Elements
+| Element | Present |
 |---------|----------|
 | Document Type Identified | ✅ / ❌ |
 | Supplier and Buyer Present | ✅ / ❌ |
@@ -139,8 +141,8 @@ Použij PŘESNĚ následující strukturu:
 | Date Present | ✅ / ❌ |
 | Payment Instructions Present | ✅ / ❌ |
 
-## 📋 Extrahované hodnoty
-| Pole | Hodnota |
+## 📋 Extracted Values
+| Field | Value |
 |------|---------|
 | Document Type | text / null |
 | Supplier | text / null |
@@ -150,16 +152,16 @@ Použij PŘESNĚ následující strukturu:
 | Payment Info | text / null |
 
 ## 🧠 Reasoning
-[Stručný rozbor na základě Master Instrukce - co jsi našel v blocích [vlevo]/[vpravo]]
+[Brief analysis based on Master Instruction - what you found in blocks [vlevo] / [vpravo]]
 
-=== STRUKTURA VSTUPU ===
-Vstup obsahuje tyto části:
-1. 🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction): Tvůj HLAVNÍ zdroj dat pro pochopení struktury.
-2. 📋 Strukturovaná data dokumentu: Přehledová tabulka (Cislo, Pozice, Text).
-3. 📜 VIZUALIZACE DOKUMENTU: Pouze pro informaci - nepoužívej pro klasifikaci!
-4. SUROVÝ TEXT: Surová data (mohou být zpřeházená).
+=== INPUT STRUCTURE ===
+Input contains these sections:
+1. 🎯 PLNÝ TEXT PODLE SOUŘADNIC (Master Instruction): Your MAIN data source
+2. 📋 Strukturovaná data dokumentu / Structured document data: Summary table
+3. 📜 VIZUALIZACE DOKUMENTU / DOCUMENT VISUALIZATION: For information only
+4. SUROVÝ TEXT / RAW TEXT: Raw data (may be disordered)
 
-=== TEXT DOKUMENTU ===
+=== DOCUMENT TEXT ===
 {input_data}"""
 
     def __init__(self, model: str = "llama3.2", timeout: int = 30, vram_limit_gb: int = None, num_ctx: int = None):
@@ -205,9 +207,10 @@ Vstup obsahuje tyto části:
         """Check for strong negative indicators and reject immediately if found."""
         text_lower = text.lower()
 
-        # Check raw text first
+        # Check raw text first - using word boundary matching for whole words only
         for indicator in self.strong_negative_indicators:
-            if indicator in text_lower:
+            # Use regex with word boundaries for whole word matching
+            if re.search(r'\b' + re.escape(indicator) + r'\b', text_lower, re.IGNORECASE):
                 logger.info(f"✓ Rychlé zamítnutí: nalezeno '{indicator}'")
                 return {
                     'is_invoice': False,
@@ -230,28 +233,35 @@ Vstup obsahuje tyto části:
                     block_texts.append(block['text'].lower())
                 elif isinstance(block, str):
                     block_texts.append(block.lower())
-            
+
             combined_blocks = ' '.join(block_texts)
-            
+
             for indicator in self.strong_negative_indicators:
-                if indicator in combined_blocks and indicator not in text_lower:
-                    logger.info(f"✓ Rychlé zamítnutí z textových bloků: nalezeno '{indicator}'")
-                    return {
-                        'is_invoice': False,
-                        'confidence': 0.95,
-                        'elements_present': {
-                            'identification': False,
-                            'subjects': False,
-                            'dates': False,
-                            'financial': False,
-                            'payment_info': False
-                        },
-                        'reasoning': f"Dokument obsahuje '{indicator}' v textových blocích - není to faktura"
-                    }
+                # Use regex with word boundaries for whole word matching
+                if re.search(r'\b' + re.escape(indicator) + r'\b', combined_blocks, re.IGNORECASE):
+                    # Double-check it's not in raw text (already checked above)
+                    if not re.search(r'\b' + re.escape(indicator) + r'\b', text_lower, re.IGNORECASE):
+                        logger.info(f"✓ Rychlé zamítnutí z textových bloků: nalezeno '{indicator}'")
+                        return {
+                            'is_invoice': False,
+                            'confidence': 0.95,
+                            'elements_present': {
+                                'identification': False,
+                                'subjects': False,
+                                'dates': False,
+                                'financial': False,
+                                'payment_info': False
+                            },
+                            'reasoning': f"Dokument obsahuje '{indicator}' v textových blocích - není to faktura"
+                        }
 
         for indicator, invoice_contexts in self.context_negative_indicators.items():
-            if indicator in text_lower:
-                has_invoice_context = any(ctx in text_lower for ctx in invoice_contexts)
+            # Use regex with word boundaries for whole word matching
+            if re.search(r'\b' + re.escape(indicator) + r'\b', text_lower, re.IGNORECASE):
+                has_invoice_context = any(
+                    re.search(r'\b' + re.escape(ctx) + r'\b', text_lower, re.IGNORECASE)
+                    for ctx in invoice_contexts
+                )
 
                 if has_invoice_context:
                     logger.debug(f"  Ignorováno '{indicator}' - výskyt ve fakturačním kontextu")
@@ -259,10 +269,10 @@ Vstup obsahuje tyto části:
 
                 if indicator in ['objednávka', 'purchase order']:
                     title_patterns = [
-                        rf'^.*{indicator}.*$',
-                        rf'\n.*{indicator}.*\n',
-                        rf'{indicator}\s*č\.',
-                        rf'{indicator}\s*#',
+                        rf'\b{re.escape(indicator)}\s*č\.',
+                        rf'\b{re.escape(indicator)}\s*#',
+                        rf'^.*\b{re.escape(indicator)}\b.*$',
+                        rf'\n.*\b{re.escape(indicator)}\b.*\n',
                     ]
                     is_title = any(re.search(pattern, text_lower, re.MULTILINE) for pattern in title_patterns)
 
@@ -420,7 +430,11 @@ Vstup obsahuje tyto části:
                 # Používáme výhradně povolená slova z tvého config/rules.yaml
                 invoice_mandatory_words = [kw.lower() for kw in self.fallback_positive]
 
-                has_invoice_word = any(word in text_lower_check for word in invoice_mandatory_words)
+                # Use regex with word boundaries for whole word matching only
+                has_invoice_word = any(
+                    re.search(r'\b' + re.escape(word) + r'\b', text_lower_check, re.IGNORECASE)
+                    for word in invoice_mandatory_words
+                )
 
                 if not has_invoice_word:
                     # Zamítneme to, i když má AI jistotu 100%!
@@ -443,6 +457,22 @@ Vstup obsahuje tyto části:
 
             logger.debug(f"✓ Klasifikace: {'Faktura' if parsed['is_invoice'] else 'Není faktura'} (jistota: {parsed['confidence']:.0%})")
 
+            # Store reasoning in shared memory
+            try:
+                memory = get_shared_memory()
+                memory.store_reasoning(
+                    agent_name="classifier",
+                    reasoning=parsed.get('reasoning', ''),
+                    confidence=parsed['confidence'],
+                    is_invoice=parsed['is_invoice'],
+                    metadata={
+                        'elements_present': parsed.get('elements_present', {}),
+                        'extracted_values': parsed.get('extracted_values', {})
+                    }
+                )
+            except Exception as mem_err:
+                logger.warning(f"Failed to store classifier reasoning in shared memory: {mem_err}")
+
             return parsed
 
         except Exception as e:
@@ -462,7 +492,7 @@ Vstup obsahuje tyto části:
            ("můj úkol" in markdown_text.lower() and "rozhodnout" in markdown_text.lower() and "fakturu" in markdown_text.lower()):
             logger.debug("Model opakuje prompt - pokus o extrakci zbytku odpovědi")
             # Pokus najít skutečnou odpověď dál v textu
-            answer_start = re.search(r'##\s*📊\s*Klasifikace', markdown_text)
+            answer_start = re.search(r'##\s*📊\s*(?:Document\s*)?Classification|##\s*📊\s*Klasifikace', markdown_text, re.IGNORECASE)
             if answer_start:
                 markdown_text = markdown_text[answer_start.start():]
             else:
@@ -472,11 +502,15 @@ Vstup obsahuje tyto části:
         # 🔧 FIX: Model začal popisovat dokument místo strukturované odpovědi
         # Hledáme začátek odpovědi kdekoli v textu
         answer_patterns = [
-            r'##\s*📊\s*Klasifikace',
-            r'##\s*📊\s*Klasifikace dokumentu',
+            r'##\s*📊\s*(?:Document\s*)?Classification',
+            r'##\s*📊\s*Klasifikace(?: dokumentu)?',
+            r'##\s*📋\s*Extracted Values',
             r'##\s*📋\s*Extrahované hodnoty',
+            r'##\s*🔍\s*Elements',
             r'##\s*🔍\s*Elementy',
+            r'\*\*Is Invoice:\*\*',
             r'\*\*Je faktura:\*\*',
+            r'Is Invoice:',
             r'Je faktura:',
         ]
 
@@ -543,10 +577,10 @@ Vstup obsahuje tyto části:
         }
 
         # 1. Je faktura
-        is_invoice_match = re.search(r'(?i)(?:\*\*Je faktura:\*\*|je faktura:)\s*(✅\s*ANO|❌\s*NE|ANO|NE|TRUE|FALSE)', markdown_text)
+        is_invoice_match = re.search(r'(?i)(?:\*\*Is Invoice:\*\*|is invoice:|\*\*Je faktura:\*\*|je faktura:)\s*(✅\s*YES|❌\s*NO|YES|NO|✅\s*ANO|❌\s*NE|ANO|NE|TRUE|FALSE)', markdown_text)
         if is_invoice_match:
             val = is_invoice_match.group(1).upper()
-            result['is_invoice'] = 'ANO' in val or 'TRUE' in val
+            result['is_invoice'] = 'ANO' in val or 'TRUE' in val or 'YES' in val
             
         # 2. Confidence
         conf_match = re.search(r'(?i)(?:\*\*Confidence:\*\*|confidence:)\s*([\d.]+)', markdown_text)
@@ -691,8 +725,15 @@ Vstup obsahuje tyto části:
         positive_keywords = self.fallback_positive
         negative_keywords = self.fallback_negative
 
-        positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
-        negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
+        # Use regex with word boundaries for whole word matching only
+        positive_count = sum(
+            1 for kw in positive_keywords
+            if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE)
+        )
+        negative_count = sum(
+            1 for kw in negative_keywords
+            if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE)
+        )
 
         # Detekce částky - důležitý indikátor faktury
         has_amount = bool(re.search(r'(?i)(?:celkem\s*k\s*úhradě|celkemkuhrade|celkem|total|grand\s*total|amount\s*due|balance\s*due|k\s*úhradě|k\s*zaplacení|částka\s*:)[\s]*(\d+(?:[\s,.]\d+)*)', text))
@@ -727,11 +768,27 @@ Vstup obsahuje tyto části:
             'is_invoice': is_invoice,
             'confidence': confidence,
             'elements_present': {
-                'identification': any(x in text_lower for x in ['faktura', 'invoice', 'tax document']),
-                'subjects': any(x in text_lower for x in ['dodavatel', 'odběratel', 'supplier', 'customer', 's.r.o.']),
-                'dates': any(x in text_lower for x in ['datum', 'splatnost', 'date', 'due date']),
-                'financial': any(x in text_lower for x in ['celkem', 'částka', 'total', 'amount']),
-                'payment_info': any(x in text_lower for x in ['účet', 'iban', 'bank account'])
+                # Use regex with word boundaries for whole word matching only
+                'identification': any(
+                    re.search(r'\b' + re.escape(x) + r'\b', text_lower, re.IGNORECASE)
+                    for x in ['faktura', 'invoice', 'tax document']
+                ),
+                'subjects': any(
+                    re.search(r'\b' + re.escape(x) + r'\b', text_lower, re.IGNORECASE)
+                    for x in ['dodavatel', 'odběratel', 'supplier', 'customer', 's.r.o.']
+                ),
+                'dates': any(
+                    re.search(r'\b' + re.escape(x) + r'\b', text_lower, re.IGNORECASE)
+                    for x in ['datum', 'splatnost', 'date', 'due date']
+                ),
+                'financial': any(
+                    re.search(r'\b' + re.escape(x) + r'\b', text_lower, re.IGNORECASE)
+                    for x in ['celkem', 'částka', 'total', 'amount']
+                ),
+                'payment_info': any(
+                    re.search(r'\b' + re.escape(x) + r'\b', text_lower, re.IGNORECASE)
+                    for x in ['účet', 'iban', 'bank account']
+                )
             },
             'extracted_values': extracted_values,
             'reasoning': f"Fallback: {positive_count} pozitiv, {negative_count} negativ, {'částka nalezena' if has_amount else 'žádná částka'}"

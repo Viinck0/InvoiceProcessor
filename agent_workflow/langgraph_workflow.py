@@ -32,6 +32,7 @@ from .classifier_agent import ClassifierAgent
 from .extractor_agent import ExtractorAgent
 from .anomaly_agent import AnomalyDetectorAgent
 from .consensus_engine import ConsensusEngine
+from .agent_memory import initialize_memory, finalize_processing, get_shared_memory
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +279,14 @@ class InvoiceWorkflowNodes:
             enriched = f"{md_table}\n\n{spatial_layout}".strip()
             logger.debug(f"✓ Text enriched and master instruction generated")
 
+            # Initialize shared memory with master instruction
+            file_path = state.get("file_path", "unknown")
+            try:
+                memory = initialize_memory(file_path, master_instruction)
+                logger.debug(f"🧠 Shared memory initialized for {file_path}")
+            except Exception as mem_err:
+                logger.warning(f"Failed to initialize shared memory: {mem_err}")
+
             return {
                 "enriched_text": enriched,
                 "master_instruction": master_instruction
@@ -294,17 +303,44 @@ class InvoiceWorkflowNodes:
         classifier_result = state.get("classifier_result", {})
         extractor_result = state.get("extractor_result", {})
         anomaly_result = state.get("anomaly_result", {})
-        
+
         try:
+            # Compare agent reasoning with master instruction before consensus
+            try:
+                memory = get_shared_memory()
+                comparison_results = memory.compare_all_agents()
+                validation_result = memory.validate_consistency()
+                logger.debug(f"🔍 Agent reasoning comparison completed")
+                
+                # Log any significant contradictions
+                for agent_name, comparison in comparison_results.items():
+                    if comparison.get('contradictions'):
+                        logger.warning(f"  ⚠️ {agent_name} has contradictions: {comparison['contradictions']}")
+                    if comparison.get('missing_elements'):
+                        logger.debug(f"  ℹ️ {agent_name} missing elements: {comparison['missing_elements']}")
+                
+                if validation_result.get('conflicts'):
+                    logger.warning(f"  ⚠️ Agent consistency conflicts: {validation_result['conflicts']}")
+                    
+            except Exception as mem_err:
+                logger.warning(f"Failed to compare agent reasoning: {mem_err}")
+
             consensus = self.consensus.calculate_consensus(
                 classifier_result,
                 extractor_result,
                 anomaly_result
             )
-            
+
             logger.debug(f"✓ Consensus: {'invoice' if consensus.get('is_invoice') else 'not invoice'} "
                         f"({consensus.get('confidence', 0):.0%}, decision: {consensus.get('decision_type')})")
-            
+
+            # Finalize processing and clear memory
+            try:
+                memory_summary = finalize_processing()
+                logger.debug(f"🧹 Memory finalized and cleared (processing time: {memory_summary.get('processing_duration', 0):.2f}s)")
+            except Exception as mem_err:
+                logger.warning(f"Failed to finalize shared memory: {mem_err}")
+
             return {
                 "consensus_result": consensus,
                 "is_invoice": consensus.get("is_invoice", False),
@@ -487,16 +523,25 @@ class SimpleInvoicePipeline:
         # Step 1: OCR Validation
         logger.debug(f"🔍 Validating OCR text for {Path(file_path).name}")
         state.update(self.nodes.ocr_validator_node(state))
-        
+
         # Step 2: Pre-filter
         logger.debug(f"📋 Running pre-filter")
         state.update(self.nodes.pre_filter_node(state))
-        
+
         # Step 3: Enrichment (if not skipped)
         if not state.get("skip_ai_processing"):
             logger.debug(f"📋 Enriching text basis")
             state.update(self.nodes.enrichment_node(state))
             
+            # Initialize shared memory after enrichment (when master_instruction is available)
+            try:
+                master_instr = state.get("master_instruction", "")
+                if master_instr:
+                    memory = initialize_memory(file_path, master_instr)
+                    logger.debug(f"🧠 Shared memory initialized for {file_path}")
+            except Exception as mem_err:
+                logger.warning(f"Failed to initialize shared memory: {mem_err}")
+
         # Step 4: AI Agents (Sequential with Feedback Loop)
         if not state.get("skip_ai_processing"):
             logger.debug(f"🤖 Running AI agents (Sequential with Feedback Loop)")
@@ -522,7 +567,7 @@ class SimpleInvoicePipeline:
                     logger.warning("  🔄 FEEDBACK LOOP: Anomaly agent refuted Classifier rejection. Running Extractor and neutralizing Classifier.")
                     state["classifier_result"]["is_invoice"] = True
                     state["classifier_result"]["confidence"] = 0.5
-                    state["classifier_result"]["reasoning"] += " | (Vyvráceno Anomaly Agentem - nalezeny prvky faktury)"
+                    state["classifier_result"]["reasoning"] = state["classifier_result"].get("reasoning", "") + " | (Vyvráceno Anomaly Agentem - nalezeny prvky faktury)"
 
                 logger.debug(f"  ⏳ Running Extractor...")
                 state.update(self.nodes.extractor_node(state))
@@ -532,11 +577,38 @@ class SimpleInvoicePipeline:
             state["classifier_result"] = {"is_invoice": False, "confidence": 0.0, "reason": "Pre-filter reject"}
             state["extractor_result"] = {"completeness_score": 0.0, "validation_errors": ["Skipped"]}
             state["anomaly_result"] = {"is_anomaly": False, "confidence": 0.0, "refutes_classifier": False}
-        
-        # Step 4: Consensus
+
+        # Step 5: Consensus (with memory comparison and cleanup)
         logger.debug(f"🎯 Calculating consensus")
+        
+        # Compare agent reasoning with master instruction before consensus
+        if not state.get("skip_ai_processing"):
+            try:
+                memory = get_shared_memory()
+                comparison_results = memory.compare_all_agents()
+                validation_result = memory.validate_consistency()
+                logger.debug(f"🔍 Agent reasoning comparison completed")
+                
+                # Log any significant contradictions
+                for agent_name, comparison in comparison_results.items():
+                    if comparison.get('contradictions'):
+                        logger.warning(f"  ⚠️ {agent_name} has contradictions: {comparison['contradictions']}")
+                
+                if validation_result.get('conflicts'):
+                    logger.warning(f"  ⚠️ Agent consistency conflicts: {validation_result['conflicts']}")
+                    
+            except Exception as mem_err:
+                logger.warning(f"Failed to compare agent reasoning: {mem_err}")
+        
         state.update(self.nodes.consensus_node(state))
         
+        # Finalize processing and clear memory (done in consensus_node, but ensure for simple pipeline)
+        try:
+            memory_summary = finalize_processing()
+            logger.debug(f"🧹 Memory finalized and cleared")
+        except Exception as mem_err:
+            logger.warning(f"Failed to finalize shared memory: {mem_err}")
+
         return state
 
 

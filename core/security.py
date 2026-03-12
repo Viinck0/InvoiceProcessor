@@ -173,20 +173,31 @@ _INJECTION_PATTERNS = [
 _MAX_REASONING_LENGTH = 2000
 
 
-def sanitize_llm_output(text: str, max_length: int = _MAX_REASONING_LENGTH) -> str:
+def sanitize_llm_output(
+    text: str,
+    max_length: int = _MAX_REASONING_LENGTH,
+    is_reasoning: bool = True
+) -> str:
     """
-    Sanitize LLM reasoning output to prevent prompt injection and data leakage.
+    Sanitize LLM output to prevent prompt injection and data leakage.
 
-    Removes:
-    - Embedded JSON structures (potential injection payloads)
-    - Code blocks (could contain executable instructions)
-    - System prompt leakage patterns
-    - HTML/script tags
-    - Excessive length (truncation)
+    When is_reasoning=True (default, for human-readable 'reasoning' fields):
+    - Removes embedded JSON structures (potential injection payloads)
+    - Removes code blocks (could contain executable instructions)
+    - Removes system prompt leakage patterns
+    - Removes HTML/script tags
+    - Truncates excessive length
+
+    When is_reasoning=False (for structured/machine data like dicts, JSON):
+    - Only removes dangerous HTML/script injection
+    - Only removes control characters
+    - Does NOT truncate or strip JSON/code blocks
 
     Args:
-        text: Raw reasoning text from LLM
+        text: Raw text from LLM
         max_length: Maximum allowed length (default: 2000 chars)
+        is_reasoning: If True, apply full sanitization incl. JSON stripping
+                      and truncation. If False, only strip HTML/scripts.
 
     Returns:
         Sanitized text safe for storage and display
@@ -196,15 +207,23 @@ def sanitize_llm_output(text: str, max_length: int = _MAX_REASONING_LENGTH) -> s
 
     sanitized = text
 
-    # Apply injection pattern filters
-    for pattern, replacement in _INJECTION_PATTERNS:
-        sanitized = pattern.sub(replacement, sanitized)
+    if is_reasoning:
+        # Full sanitization: strip JSON, code blocks, prompt leakage, HTML
+        for pattern, replacement in _INJECTION_PATTERNS:
+            sanitized = pattern.sub(replacement, sanitized)
 
-    # Truncate if too long
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length] + "… [TRUNCATED]"
+        # Truncate if too long (only for human-readable reasoning)
+        if len(sanitized) > max_length:
+            sanitized = sanitized[:max_length] + "… [TRUNCATED]"
+    else:
+        # Lightweight sanitization: only strip dangerous HTML/script tags
+        # Preserve JSON and code blocks needed for machine processing
+        for pattern, replacement in _INJECTION_PATTERNS:
+            # Only apply HTML/script patterns (last two in the list)
+            if replacement in ("[FILTERED_SCRIPT]", "[FILTERED_IFRAME]"):
+                sanitized = pattern.sub(replacement, sanitized)
 
-    # Remove null bytes and control characters (except newline/tab)
+    # Always remove null bytes and control characters (except newline/tab)
     sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', sanitized)
 
     return sanitized.strip()
@@ -511,6 +530,10 @@ def cleanup_old_files(
                     file_path.unlink()
                     logger.info(f"🗑️ Deleted: {file_path.name} (age: {(datetime.now() - mtime).days}d)")
                 deleted.append(str(file_path))
+        except FileNotFoundError:
+            # File was already deleted by another process — goal achieved
+            logger.debug(f"File already removed (concurrent deletion): {file_path.name}")
+            deleted.append(str(file_path))
         except Exception as e:
             logger.warning(f"Cleanup error for {file_path.name}: {e}")
 

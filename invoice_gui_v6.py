@@ -972,6 +972,13 @@ class InvoiceProcessorGUIV6(ctk.CTk):
         self.invoices = []
         self.review_queue = []
 
+        # 🔒 THREAD-SAFETY: Read ALL Tkinter variables in the main thread
+        # and cache them as plain Python attributes for the worker thread.
+        # Tkinter/Tcl is NOT thread-safe — calling .get() from a background
+        # thread can freeze or crash the entire application on Windows.
+        self._cached_source_dir = source
+        self._cached_vram_limit = self.vram_var.get() if hasattr(self, 'vram_var') else 4
+
         self.is_processing = True
         self.process_btn.configure(state="disabled", text="⏳ Zpracovávám...")
         self.stop_btn.configure(state="normal")
@@ -996,7 +1003,9 @@ class InvoiceProcessorGUIV6(ctk.CTk):
             self.after(0, lambda: self.progress_label.configure(text="Inicializace agentů..."))
 
             if self.processing_start_index == 0:
-                vram_limit = self.vram_var.get() if hasattr(self, 'vram_var') else 4
+                # 🔒 THREAD-SAFETY: Use cached values read in the main thread
+                # instead of calling self.vram_var.get() here (Tkinter is NOT thread-safe)
+                vram_limit = self._cached_vram_limit
                 num_ctx = calculate_num_ctx(vram_limit)
 
                 logger.info(f"Inicializace agentů: VRAM={vram_limit}GB, num_ctx={num_ctx}")
@@ -1009,7 +1018,8 @@ class InvoiceProcessorGUIV6(ctk.CTk):
             self.after(0, lambda: self.progress_label.configure(text="Vyhledávání souborů..."))
 
             if not self.found_files or self.processing_start_index == 0:
-                discovery = FileDiscovery(Path(self.source_dir.get()))
+                # 🔒 THREAD-SAFETY: Use cached source_dir instead of self.source_dir.get()
+                discovery = FileDiscovery(Path(self._cached_source_dir))
                 self.found_files = discovery.find_files()
 
             total = len(self.found_files)
