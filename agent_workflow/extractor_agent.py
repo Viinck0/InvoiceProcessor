@@ -381,8 +381,8 @@ e.g.: "Supplier found in top block [vlevo]..."
         # Tím eliminujeme riziko, že parser omylem sebere jinou tabulku.
         # Fallback: pokud sekci nenajdeme, parsujeme celý text (legacy).
         def _extract_extracted_data_section(md: str) -> str:
-            m = re.search(r'(?is)##\s*[^\n]*extracted\s+data|##\s*[^\n]*extrahovan[áa]\s+data\s*\n(.*?)(?:\n##\s+|\Z)', md)
-            return (m.group(1).strip() if m else "")
+            m = re.search(r'(?is)##\s*[^\n]*(?:extracted\s+data|extrahovan[áa]\s+data)\s*\n(.*?)(?:\n##\s+|\Z)', md)
+            return (m.group(1).strip() if m and m.group(1) else "")
 
         md_for_table = _extract_extracted_data_section(markdown_text)
         if not md_for_table:

@@ -436,19 +436,87 @@ RULES:
 
         return valid_keywords
 
+    def _check_invoice_keywords(self, text: str) -> dict:
+        """
+        🔧 NOVÉ: Kontrola zda text obsahuje invoice keywords.
+
+        Pokud dokument obsahuje silné invoice keywords, NEMŮŽE být anomálie.
+
+        Args:
+            text: Markdown text dokumentu
+
+        Returns:
+            Dict s informacemi o nalezených invoice keywords
+        """
+        text_lower = text.lower()
+
+        # Silná invoice keywords (když se najdou → určitě je to faktura)
+        strong_invoice_keywords = [
+            'faktura', 'invoice', 'daňový doklad', 'tax document',
+            'celkem k úhradě', 'total amount', 'celkem', 'total',
+            'k úhradě', 'amount due', 'částka', 'price',
+            'dodavatel', 'odběratel', 'supplier', 'customer',
+            'variabilní symbol', 'payment reference',
+            'iban', 'bic', 'účet', 'bank account'
+        ]
+
+        found_strong = []
+        for kw in strong_invoice_keywords:
+            if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE):
+                found_strong.append(kw)
+
+        # Slabší invoice keywords (podpůrné)
+        weak_invoice_keywords = [
+            's.r.o.', 'a.s.', 'gmbh', 'ltd', 'inc', 'company',
+            'ičo', 'dič', 'vat id', 'tax id',
+            'datum vystavení', 'issue date', 'datum splatnosti', 'due date',
+            'kč', 'czk', 'eur', '€', '$', '£',
+            'bez dph', 'dpH', 'sazba', 'základ daně'
+        ]
+
+        found_weak = []
+        for kw in weak_invoice_keywords:
+            if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE):
+                found_weak.append(kw)
+
+        has_strong = len(found_strong) >= 1
+        has_weak = len(found_weak) >= 2  # Slabších potřebujeme alespoň 2
+
+        is_definitely_invoice = has_strong or (has_weak and len(found_weak) >= 3)
+
+        result = {
+            'has_strong_invoice_keywords': has_strong,
+            'has_weak_invoice_keywords': has_weak,
+            'found_strong_keywords': found_strong,
+            'found_weak_keywords': found_weak,
+            'is_definitely_invoice': is_definitely_invoice,
+            'invoice_keyword_count': len(found_strong) + len(found_weak)
+        }
+
+        if is_definitely_invoice:
+            logger.debug(f"  ✓ Invoice keywords detekovány: {found_strong + found_weak[:5]}")
+        else:
+            logger.debug(f"  ⚠️ Slabé invoice keywords: strong={len(found_strong)}, weak={len(found_weak)}")
+
+        return result
+
     def _rule_based_detection(self, text: str, metadata: Optional[dict] = None) -> dict:
         """
         Fast rule-based anomaly detection.
-        
+
         🔧 FIX: Added detailed logging for keyword debugging.
+        🔧 FIX 2: Check invoice keywords BEFORE rejecting as anomaly!
         """
         text_lower = text.lower()
+
+        # 🔧 NOVÉ: Nejprve zkontroluj invoice keywords
+        invoice_check = self._check_invoice_keywords(text)
 
         detected_anomalies = []
         all_keywords = []
 
         logger.debug(f"  🔍 Rule-based detection started, checking {len(self.patterns)} anomaly types")
-        
+
         for anomaly_type, config in self.patterns.items():
             keywords = config.get('keywords', [])
             threshold = config.get('threshold', 2)
@@ -457,9 +525,11 @@ RULES:
             # 🔧 FIX: Use word boundary matching instead of substring matching
             found_keywords = []
             for kw in keywords:
+                # 🚫 DŮLEŽITÉ: Ignoruj anomaly keywords pokud jsou v invoice kontextu
+                # Např. "objednávka" v "faktura z objednávky č. X" není anomálie!
                 if re.search(r'\b' + re.escape(kw) + r'\b', text_lower, re.IGNORECASE):
                     found_keywords.append(kw)
-            
+
             if found_keywords:
                 logger.debug(f"    {anomaly_type}: nalezeno {len(found_keywords)} keywords (threshold={threshold}, veto={veto}): {found_keywords}")
 
@@ -472,7 +542,19 @@ RULES:
                     'veto': config.get('veto', False)
                 })
                 all_keywords.extend(found_keywords)
-        
+
+        # 🔧 NOVÉ: Pokud jsou invoice keywords → ignoruj anomálie!
+        if invoice_check['is_definitely_invoice']:
+            logger.debug(f"  ✓ Invoice keywords přebíjejí anomálie! Strong: {invoice_check['found_strong_keywords']}")
+            return {
+                'is_anomaly': False,
+                'anomaly_type': None,
+                'confidence': 0.95,
+                'detected_keywords': [],
+                'flags': [],
+                'reasoning': f'Dokument obsahuje invoice keywords: {", ".join(invoice_check["found_strong_keywords"][:3])}'
+            }
+
         if not detected_anomalies:
             logger.debug(f"  ✓ Rule-based: žádné anomálie detekovány")
             return {
@@ -487,7 +569,7 @@ RULES:
         # Sort by severity (veto types first)
         detected_anomalies.sort(key=lambda x: (x['veto'], x['count']), reverse=True)
         primary = detected_anomalies[0]
-        
+
         logger.debug(f"  ⚠️ Rule-based detekovala anomálii: {primary['type']} ({primary['count']} keywords, veto={primary['veto']})")
 
         # Calculate confidence
